@@ -515,6 +515,14 @@ pre-flight-steps:
 ruff:  #-- Run ruff linter with automatic fixes
 	VIRTUAL_ENV= uv run --project python --no-sync ruff check . --config python/pyproject.toml --fix --force-exclude
 
+.PHONY: typos
+typos:  #-- Run the typos spell checker on all tracked files
+	@if ! command -v typos >/dev/null 2>&1; then \
+		echo "typos is not installed. You can install it using 'cargo install typos-cli'"; \
+		exit 1; \
+	fi
+	git ls-files | typos --force-exclude --threads 2 --file-list -
+
 .PHONY: clippy
 clippy: check-cargo-cooldown  #-- Run clippy linter (check only, workspace lints)
 	cargo clippy --locked --all-targets --all-features -- -D warnings
