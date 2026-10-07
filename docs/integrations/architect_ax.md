@@ -479,6 +479,11 @@ the window do not open phantom positions on restart. Without a bound, every hist
 on the account is fetched and reconciled at startup.
 :::
 
+`LiveNode` fetches single-order, bulk order, fill, and position reports over HTTP on workers,
+then releases client order ID tracking for closed orders on its main thread before
+reconciliation. Single-order reports scan `/open-orders`, so an order that is no longer open
+returns no report. Startup and post-reconnect mass status bypass these hooks.
+
 :::warning
 After a restart without cached replacement history, reconciliation can apply an older order's
 state or fields to its replacement, making a working order appear canceled locally. Recovery

@@ -56,7 +56,7 @@ use nautilus_binance::{
 };
 use nautilus_common::{
     cache::Cache,
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     clock::VirtualClock,
     enums::LogLevel,
     live::runner::{replace_system_event_sender, set_exec_event_sender},
@@ -96,7 +96,7 @@ use nautilus_model::{
         StopMarketOrder, TrailingStopMarketOrder, stubs::TestOrderEventStubs,
     },
     position::Position,
-    reports::{ExecutionMassStatus, PositionStatusReport},
+    reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -3942,8 +3942,10 @@ async fn test_delivery_reports_use_raw_binance_symbol() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_delivery_reconciliation_emits_open_order_and_position_reports(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
         ReportFixtureMode::Delivery,
@@ -3958,8 +3960,9 @@ async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
     client.start().unwrap();
     client.connect().await.unwrap();
 
-    let orders = client
-        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+    let orders = generate_order_reports(
+        &client,
+        &GenerateOrderStatusReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             true,
@@ -3968,11 +3971,14 @@ async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
-    let positions = client
-        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
+    let positions = generate_positions(
+        &client,
+        &GeneratePositionStatusReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             None,
@@ -3980,9 +3986,11 @@ async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
 
     assert!(
         orders
@@ -3997,11 +4005,12 @@ async fn test_delivery_reconciliation_emits_open_order_and_position_reports() {
 #[case::explicitly_out_of_scope(false, Some(vec!["XAUUSDT-PERP.BINANCE"]), false)]
 #[case::no_explicit_ids(false, None, true)]
 #[case::load_all_ignores_ids(true, Some(vec!["XAUUSDT-PERP.BINANCE"]), false)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_open_reconciliation_applies_only_explicit_load_id_scope(
     #[case] load_all: bool,
     #[case] load_ids: Option<Vec<&str>>,
     #[case] expect_error: bool,
+    #[values(false, true)] worker: bool,
 ) {
     let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
@@ -4023,8 +4032,9 @@ async fn test_open_reconciliation_applies_only_explicit_load_id_scope(
     client.start().unwrap();
     client.connect().await.unwrap();
 
-    let result = client
-        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+    let result = generate_order_reports(
+        &client,
+        &GenerateOrderStatusReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             true,
@@ -4033,8 +4043,10 @@ async fn test_open_reconciliation_applies_only_explicit_load_id_scope(
             None,
             None,
             None,
-        ))
-        .await;
+        ),
+        worker,
+    )
+    .await;
 
     if expect_error {
         assert_eq!(
@@ -4107,8 +4119,10 @@ async fn test_bounded_mass_status_marks_unresolved_historical_fills_incomplete()
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_futures_reconciliation_rejects_spot_identity_before_query() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_futures_reconciliation_rejects_spot_identity_before_query(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
         ReportFixtureMode::FillsOnly,
@@ -4122,8 +4136,9 @@ async fn test_futures_reconciliation_rejects_spot_identity_before_query() {
     client.start().unwrap();
     client.connect().await.unwrap();
 
-    let fills = client
-        .generate_fill_reports(GenerateFillReports::new(
+    let fills = generate_fills(
+        &client,
+        GenerateFillReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             Some(spot_id),
@@ -4132,11 +4147,14 @@ async fn test_futures_reconciliation_rejects_spot_identity_before_query() {
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
-    let orders = client
-        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
+    let orders = generate_order_reports(
+        &client,
+        &GenerateOrderStatusReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             true,
@@ -4145,9 +4163,11 @@ async fn test_futures_reconciliation_rejects_spot_identity_before_query() {
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap_err();
+        ),
+        worker,
+    )
+    .await
+    .unwrap_err();
 
     assert!(fills.is_empty());
     assert_eq!(
@@ -4165,8 +4185,10 @@ async fn test_futures_reconciliation_rejects_spot_identity_before_query() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_historical_reconciliation_skips_unresolved_instrument_before_query() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_historical_reconciliation_skips_unresolved_instrument_before_query(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
         ReportFixtureMode::FillsOnly,
@@ -4187,8 +4209,9 @@ async fn test_historical_reconciliation_skips_unresolved_instrument_before_query
     client.start().unwrap();
     client.connect().await.unwrap();
 
-    let order = client
-        .generate_order_status_report(&GenerateOrderStatusReport::new(
+    let order = generate_order_report(
+        &client,
+        &GenerateOrderStatusReport::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             Some(instrument_id),
@@ -4196,11 +4219,14 @@ async fn test_historical_reconciliation_skips_unresolved_instrument_before_query
             Some(VenueOrderId::from("12345")),
             None,
             None,
-        ))
-        .await
-        .unwrap_err();
-    let orders = client
-        .generate_order_status_reports(&GenerateOrderStatusReports::new(
+        ),
+        worker,
+    )
+    .await
+    .unwrap_err();
+    let orders = generate_order_reports(
+        &client,
+        &GenerateOrderStatusReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             false,
@@ -4209,11 +4235,14 @@ async fn test_historical_reconciliation_skips_unresolved_instrument_before_query
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
-    let fills = client
-        .generate_fill_reports(GenerateFillReports::new(
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
+    let fills = generate_fills(
+        &client,
+        GenerateFillReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             Some(instrument_id),
@@ -4222,9 +4251,11 @@ async fn test_historical_reconciliation_skips_unresolved_instrument_before_query
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         order.to_string(),
@@ -4238,8 +4269,10 @@ async fn test_historical_reconciliation_skips_unresolved_instrument_before_query
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_position_reconciliation_rejects_unresolved_instrument_before_query() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_position_reconciliation_rejects_unresolved_instrument_before_query(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
         ReportFixtureMode::Populated,
@@ -4260,8 +4293,9 @@ async fn test_position_reconciliation_rejects_unresolved_instrument_before_query
     client.start().unwrap();
     client.connect().await.unwrap();
 
-    let error = client
-        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+    let error = generate_positions(
+        &client,
+        &GeneratePositionStatusReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             Some(instrument_id),
@@ -4269,9 +4303,11 @@ async fn test_position_reconciliation_rejects_unresolved_instrument_before_query
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap_err();
+        ),
+        worker,
+    )
+    .await
+    .unwrap_err();
 
     assert_eq!(
         error.to_string(),
@@ -4286,8 +4322,10 @@ async fn test_position_reconciliation_rejects_unresolved_instrument_before_query
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_historical_algo_report_bypasses_regular_order_id_collision() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_historical_algo_report_bypasses_regular_order_id_collision(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
         ReportFixtureMode::Populated,
@@ -4313,8 +4351,7 @@ async fn test_historical_algo_report_bypasses_regular_order_id_collision() {
         None,
     );
 
-    let result = client
-        .generate_order_status_report(&report)
+    let result = generate_order_report(&client, &report, worker)
         .await
         .unwrap()
         .unwrap();
@@ -4357,8 +4394,10 @@ async fn test_historical_algo_report_bypasses_regular_order_id_collision() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_historical_algo_report_rejects_non_matching_history_result() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_historical_algo_report_rejects_non_matching_history_result(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             submit: CommandResponse::VenueReject {
@@ -4388,7 +4427,9 @@ async fn test_historical_algo_report_rejects_non_matching_history_result() {
         None,
     );
 
-    let result = client.generate_order_status_report(&report).await.unwrap();
+    let result = generate_order_report(&client, &report, worker)
+        .await
+        .unwrap();
 
     assert!(result.is_none());
     let history_queries = wait_for_queries(&captured_queries, "allAlgoOrders", 1).await;
@@ -4403,8 +4444,10 @@ async fn test_historical_algo_report_rejects_non_matching_history_result() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_historical_algo_report_client_id_not_found_returns_none() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_historical_algo_report_client_id_not_found_returns_none(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             submit: CommandResponse::VenueReject {
@@ -4436,7 +4479,9 @@ async fn test_historical_algo_report_client_id_not_found_returns_none() {
         None,
     );
 
-    let result = client.generate_order_status_report(&report).await.unwrap();
+    let result = generate_order_report(&client, &report, worker)
+        .await
+        .unwrap();
 
     assert!(result.is_none());
     let algo_query = wait_for_query(&captured_queries, "algoOrder").await;
@@ -4451,8 +4496,10 @@ async fn test_historical_algo_report_client_id_not_found_returns_none() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_unknown_order_id_collision_does_not_query_algo_by_venue_id() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unknown_order_id_collision_does_not_query_algo_by_venue_id(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             submit: CommandResponse::VenueReject {
@@ -4482,7 +4529,9 @@ async fn test_unknown_order_id_collision_does_not_query_algo_by_venue_id() {
         None,
     );
 
-    let result = client.generate_order_status_report(&report).await.unwrap();
+    let result = generate_order_report(&client, &report, worker)
+        .await
+        .unwrap();
 
     assert!(result.is_none());
     let algo_query = wait_for_query(&captured_queries, "algoOrder").await;
@@ -4502,8 +4551,10 @@ async fn test_unknown_order_id_collision_does_not_query_algo_by_venue_id() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_cached_regular_order_id_collision_skips_algo_fallback() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cached_regular_order_id_collision_skips_algo_fallback(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             submit: CommandResponse::VenueReject {
@@ -4535,7 +4586,9 @@ async fn test_cached_regular_order_id_collision_skips_algo_fallback() {
         None,
     );
 
-    let result = client.generate_order_status_report(&report).await.unwrap();
+    let result = generate_order_report(&client, &report, worker)
+        .await
+        .unwrap();
 
     assert!(result.is_none());
     wait_for_query(&captured_queries, "order").await;
@@ -4548,8 +4601,10 @@ async fn test_cached_regular_order_id_collision_skips_algo_fallback() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_algo_report_by_client_id_enriches_from_actual_order() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_algo_report_by_client_id_enriches_from_actual_order(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             submit: CommandResponse::VenueReject {
@@ -4579,8 +4634,7 @@ async fn test_algo_report_by_client_id_enriches_from_actual_order() {
         None,
     );
 
-    let result = client
-        .generate_order_status_report(&report)
+    let result = generate_order_report(&client, &report, worker)
         .await
         .unwrap()
         .unwrap();
@@ -4605,8 +4659,10 @@ async fn test_algo_report_by_client_id_enriches_from_actual_order() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_algo_report_by_client_id_falls_back_when_actual_order_enrichment_fails() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_algo_report_by_client_id_falls_back_when_actual_order_enrichment_fails(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             submit: CommandResponse::VenueReject {
@@ -4637,8 +4693,7 @@ async fn test_algo_report_by_client_id_falls_back_when_actual_order_enrichment_f
         None,
     );
 
-    let result = client
-        .generate_order_status_report(&report)
+    let result = generate_order_report(&client, &report, worker)
         .await
         .unwrap()
         .unwrap();
@@ -4661,8 +4716,10 @@ async fn test_algo_report_by_client_id_falls_back_when_actual_order_enrichment_f
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_algo_report_falls_back_when_actual_order_conversion_fails() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_algo_report_falls_back_when_actual_order_conversion_fails(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             submit: CommandResponse::VenueReject {
@@ -4693,8 +4750,7 @@ async fn test_algo_report_falls_back_when_actual_order_conversion_fails() {
         None,
     );
 
-    let result = client
-        .generate_order_status_report(&report)
+    let result = generate_order_report(&client, &report, worker)
         .await
         .unwrap()
         .unwrap();
@@ -4717,8 +4773,10 @@ async fn test_algo_report_falls_back_when_actual_order_conversion_fails() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_cached_algo_actual_order_id_uses_client_id_fallback() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cached_algo_actual_order_id_uses_client_id_fallback(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses {
             actual_order_query: CommandResponse::VenueReject {
@@ -4757,7 +4815,9 @@ async fn test_cached_algo_actual_order_id_uses_client_id_fallback() {
         None,
     );
 
-    let result = client.generate_order_status_report(&report).await.unwrap();
+    let result = generate_order_report(&client, &report, worker)
+        .await
+        .unwrap();
 
     assert!(result.is_none());
     let algo_query = wait_for_query(&captured_queries, "algoOrder").await;
@@ -4977,8 +5037,10 @@ async fn test_query_order_cached_regular_id_collision_skips_algo_fallback() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_report_generation_uses_binance_symbol_for_futures_symbol() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_report_generation_uses_binance_symbol_for_futures_symbol(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture().await;
     let base_url_http = format!("http://{addr}");
     let base_url_ws = format!("ws://{addr}/ws");
@@ -5000,8 +5062,7 @@ async fn test_report_generation_uses_binance_symbol_for_futures_symbol() {
         None,
     );
 
-    client
-        .generate_order_status_report(&order_report)
+    generate_order_report(&client, &order_report, worker)
         .await
         .unwrap();
     assert_query_symbol(&wait_for_query(&captured_queries, "order").await.query);
@@ -5017,8 +5078,7 @@ async fn test_report_generation_uses_binance_symbol_for_futures_symbol() {
         None,
     );
 
-    client
-        .generate_order_status_reports(&open_orders)
+    generate_order_reports(&client, &open_orders, worker)
         .await
         .unwrap();
     assert_query_symbol(&wait_for_query(&captured_queries, "openOrders").await.query);
@@ -5039,8 +5099,7 @@ async fn test_report_generation_uses_binance_symbol_for_futures_symbol() {
         None,
     );
 
-    client
-        .generate_order_status_reports(&all_orders)
+    generate_order_reports(&client, &all_orders, worker)
         .await
         .unwrap();
     assert_query_symbol(&wait_for_query(&captured_queries, "allOrders").await.query);
@@ -5056,7 +5115,7 @@ async fn test_report_generation_uses_binance_symbol_for_futures_symbol() {
         None,
     );
 
-    client.generate_fill_reports(fills).await.unwrap();
+    generate_fills(&client, fills, worker).await.unwrap();
     assert_query_symbol(&wait_for_query(&captured_queries, "userTrades").await.query);
 
     let positions = GeneratePositionStatusReports::new(
@@ -5069,8 +5128,7 @@ async fn test_report_generation_uses_binance_symbol_for_futures_symbol() {
         None,
     );
 
-    client
-        .generate_position_status_reports(&positions)
+    generate_positions(&client, &positions, worker)
         .await
         .unwrap();
     assert_query_symbol(
@@ -5450,10 +5508,11 @@ const USER_TRADES_COMPLETE_LOOKBACK_MINS: u64 = 88 * 24 * 60;
 #[case::usdm_bounded(BinanceProductType::UsdM, true)]
 #[case::coinm_unbounded(BinanceProductType::CoinM, false)]
 #[case::coinm_bounded(BinanceProductType::CoinM, true)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_generate_fill_reports_filters_venue_order_id(
     #[case] product_type: BinanceProductType,
     #[case] bounded: bool,
+    #[values(false, true)] worker: bool,
 ) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
@@ -5480,8 +5539,9 @@ async fn test_generate_fill_reports_filters_venue_order_id(
             .unwrap()
             .as_nanos() as u64,
     );
-    let reports = client
-        .generate_fill_reports(GenerateFillReports::new(
+    let reports = generate_fills(
+        &client,
+        GenerateFillReports::new(
             nautilus_core::UUID4::new(),
             now,
             Some(instrument_id),
@@ -5490,9 +5550,11 @@ async fn test_generate_fill_reports_filters_venue_order_id(
             bounded.then_some(now),
             None,
             None,
-        ))
-        .await
-        .unwrap();
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
     let queries = captured_queries.lock();
 
     assert_eq!(reports.len(), 1);
@@ -5513,10 +5575,11 @@ async fn test_generate_fill_reports_filters_venue_order_id(
 #[case::coinm_wholly_before(BinanceProductType::CoinM, FillRangeCoverage::WhollyBefore)]
 #[case::coinm_crossing(BinanceProductType::CoinM, FillRangeCoverage::Crossing)]
 #[case::coinm_exact_boundary(BinanceProductType::CoinM, FillRangeCoverage::ExactBoundary)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_generate_fill_reports_enforces_complete_history_boundary(
     #[case] product_type: BinanceProductType,
     #[case] coverage: FillRangeCoverage,
+    #[values(false, true)] worker: bool,
 ) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
@@ -5556,8 +5619,9 @@ async fn test_generate_fill_reports_enforces_complete_history_boundary(
     };
     captured_queries.lock().clear();
 
-    let result = client
-        .generate_fill_reports(GenerateFillReports::new(
+    let result = generate_fills(
+        &client,
+        GenerateFillReports::new(
             nautilus_core::UUID4::new(),
             mass_status.ts_init,
             Some(instrument_id),
@@ -5566,8 +5630,10 @@ async fn test_generate_fill_reports_enforces_complete_history_boundary(
             Some(end),
             None,
             None,
-        ))
-        .await;
+        ),
+        worker,
+    )
+    .await;
 
     match coverage {
         FillRangeCoverage::WhollyBefore | FillRangeCoverage::Crossing => {
@@ -5596,8 +5662,8 @@ async fn test_generate_fill_reports_enforces_complete_history_boundary(
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_generate_fill_reports_rejects_end_only_range() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_fill_reports_rejects_end_only_range(#[values(false, true)] worker: bool) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
         ReportFixtureMode::Empty,
@@ -5611,8 +5677,9 @@ async fn test_generate_fill_reports_rejects_end_only_range() {
     client.connect().await.unwrap();
     captured_queries.lock().clear();
 
-    let result = client
-        .generate_fill_reports(GenerateFillReports::new(
+    let result = generate_fills(
+        &client,
+        GenerateFillReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             Some(test_instrument_id()),
@@ -5621,8 +5688,10 @@ async fn test_generate_fill_reports_rejects_end_only_range() {
             Some(UnixNanos::from(1_800_000_000_000_000_000)),
             None,
             None,
-        ))
-        .await;
+        ),
+        worker,
+    )
+    .await;
 
     assert_eq!(
         result.unwrap_err().to_string(),
@@ -5637,8 +5706,10 @@ async fn test_generate_fill_reports_rejects_end_only_range() {
 }
 
 #[rstest]
-#[tokio::test]
-async fn test_generate_fill_reports_rejects_stale_command_boundary() {
+#[tokio::test(flavor = "multi_thread")]
+async fn test_generate_fill_reports_rejects_stale_command_boundary(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
         ReportFixtureMode::Empty,
@@ -5661,8 +5732,9 @@ async fn test_generate_fill_reports_rejects_stale_command_boundary() {
     let ts_init = ts_now.saturating_sub(DurationNanos::from_days(1));
     let start =
         ts_init.saturating_sub(DurationNanos::from_mins(USER_TRADES_COMPLETE_LOOKBACK_MINS));
-    let result = client
-        .generate_fill_reports(GenerateFillReports::new(
+    let result = generate_fills(
+        &client,
+        GenerateFillReports::new(
             nautilus_core::UUID4::new(),
             ts_init,
             Some(test_instrument_id()),
@@ -5671,8 +5743,10 @@ async fn test_generate_fill_reports_rejects_stale_command_boundary() {
             Some(start + DurationNanos::from_millis(1)),
             None,
             None,
-        ))
-        .await;
+        ),
+        worker,
+    )
+    .await;
 
     assert!(result.unwrap_err().to_string().starts_with(&format!(
         "Binance Futures fill report range is incomplete: start {start} precedes complete-history boundary"
@@ -5896,10 +5970,11 @@ async fn test_generate_mass_status_filters_fills_before_report_window() {
 #[rstest]
 #[case(true, Some("BTCUSDT-PERP.BINANCE-LONG"))]
 #[case(false, None)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_report_generation_without_instrument_matches_raw_symbol_responses(
     #[case] use_position_ids: bool,
     #[case] expected_fill_position_id: Option<&str>,
+    #[values(false, true)] worker: bool,
 ) {
     let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
@@ -5935,8 +6010,7 @@ async fn test_report_generation_without_instrument_matches_raw_symbol_responses(
         None,
     );
 
-    let order_reports = client
-        .generate_order_status_reports(&open_orders)
+    let order_reports = generate_order_reports(&client, &open_orders, worker)
         .await
         .unwrap();
 
@@ -5949,8 +6023,9 @@ async fn test_report_generation_without_instrument_matches_raw_symbol_responses(
     assert_eq!(order_reports[0].venue_position_id, None);
     assert_eq!(order_reports[1].venue_position_id, None);
 
-    let fill_reports = client
-        .generate_fill_reports(GenerateFillReports::new(
+    let fill_reports = generate_fills(
+        &client,
+        GenerateFillReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             Some(test_instrument_id()),
@@ -5959,9 +6034,11 @@ async fn test_report_generation_without_instrument_matches_raw_symbol_responses(
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(fill_reports.len(), 1);
     assert_eq!(
@@ -5979,8 +6056,7 @@ async fn test_report_generation_without_instrument_matches_raw_symbol_responses(
         None,
     );
 
-    let position_reports = client
-        .generate_position_status_reports(&positions)
+    let position_reports = generate_positions(&client, &positions, worker)
         .await
         .unwrap();
 
@@ -5996,11 +6072,12 @@ async fn test_report_generation_without_instrument_matches_raw_symbol_responses(
     Some("BTCUSDT-PERP.BINANCE-SHORT")
 )]
 #[case(false, None, None)]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_position_report_generation_preserves_hedge_legs(
     #[case] use_position_ids: bool,
     #[case] expected_id_long: Option<&str>,
     #[case] expected_id_short: Option<&str>,
+    #[values(false, true)] worker: bool,
 ) {
     let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
         CommandResponses::default(),
@@ -6021,8 +6098,9 @@ async fn test_position_report_generation_preserves_hedge_legs(
     client.start().unwrap();
     client.connect().await.unwrap();
 
-    let reports = client
-        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+    let reports = generate_positions(
+        &client,
+        &GeneratePositionStatusReports::new(
             nautilus_core::UUID4::new(),
             UnixNanos::default(),
             None,
@@ -6030,9 +6108,11 @@ async fn test_position_report_generation_preserves_hedge_legs(
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(reports.len(), 2);
     assert_eq!(reports[0].account_id, account_id);
@@ -8247,4 +8327,180 @@ async fn test_tagged_lookup_failure_is_rejected_before_submission(
         message["method"].as_str(),
         Some("order.cancel" | "order.modify")
     )));
+}
+
+async fn run_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
+    let core_thread = std::thread::current().id();
+    tokio::spawn(async move {
+        assert_ne!(std::thread::current().id(), core_thread);
+        task.collection.await;
+    })
+    .await
+    .unwrap();
+
+    task.result.await
+}
+
+async fn generate_order_report(
+    client: &BinanceFuturesExecutionClient,
+    cmd: &GenerateOrderStatusReport,
+    worker: bool,
+) -> anyhow::Result<Option<OrderStatusReport>> {
+    if worker {
+        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
+    } else {
+        client.generate_order_status_report(cmd).await
+    }
+}
+
+async fn generate_order_reports(
+    client: &BinanceFuturesExecutionClient,
+    cmd: &GenerateOrderStatusReports,
+    worker: bool,
+) -> anyhow::Result<Vec<OrderStatusReport>> {
+    if worker {
+        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
+    } else {
+        client.generate_order_status_reports(cmd).await
+    }
+}
+
+async fn generate_fills(
+    client: &BinanceFuturesExecutionClient,
+    cmd: GenerateFillReports,
+    worker: bool,
+) -> anyhow::Result<Vec<FillReport>> {
+    if worker {
+        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
+    } else {
+        client.generate_fill_reports(cmd).await
+    }
+}
+
+async fn generate_positions(
+    client: &BinanceFuturesExecutionClient,
+    cmd: &GeneratePositionStatusReports,
+    worker: bool,
+) -> anyhow::Result<Vec<PositionStatusReport>> {
+    if worker {
+        run_report_task(client.generate_position_status_reports_task(cmd).unwrap()).await
+    } else {
+        client.generate_position_status_reports(cmd).await
+    }
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_open_order_report_task_matches_inline_close_position_restore() {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::ClosePosition,
+    )
+    .await;
+    let (mut client, _rx, cache) =
+        create_test_execution_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    add_test_instrument_to_cache(&cache);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let cmd = GenerateOrderStatusReports::new(
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let summarize = |reports: Vec<OrderStatusReport>| {
+        let mut summary: Vec<_> = reports
+            .into_iter()
+            .map(|report| {
+                (
+                    report.venue_order_id,
+                    report.client_order_id,
+                    report.order_status,
+                    report.quantity,
+                    report.filled_qty,
+                    report.reduce_only,
+                    report.venue_position_id,
+                )
+            })
+            .collect();
+        summary.sort_by_key(|entry| entry.0);
+        summary
+    };
+
+    let inline = summarize(generate_order_reports(&client, &cmd, false).await.unwrap());
+    let worker = summarize(generate_order_reports(&client, &cmd, true).await.unwrap());
+
+    assert_eq!(inline.len(), 5);
+    assert_eq!(worker, inline);
+}
+
+#[rstest]
+#[case::positions(false)]
+#[case::open_orders(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_report_task_checks_cached_position_ids_on_core_after_collection(
+    #[case] open_orders: bool,
+) {
+    let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        if open_orders {
+            ReportFixtureMode::ClosePosition
+        } else {
+            ReportFixtureMode::HedgePositions
+        },
+    )
+    .await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_position_ids(
+        format!("http://{addr}"),
+        format!("ws://{addr}/ws"),
+        true,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    add_test_instrument_to_cache(&cache);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let result = if open_orders {
+        let task = client
+            .generate_order_status_reports_task(&GenerateOrderStatusReports::new(
+                nautilus_core::UUID4::new(),
+                UnixNanos::default(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+        tokio::spawn(task.collection).await.unwrap();
+        add_legacy_hedge_position_to_cache(&cache);
+        task.result.await.map(|reports| reports.len())
+    } else {
+        let task = client
+            .generate_position_status_reports_task(&GeneratePositionStatusReports::new(
+                nautilus_core::UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+        tokio::spawn(task.collection).await.unwrap();
+        add_legacy_hedge_position_to_cache(&cache);
+        task.result.await.map(|reports| reports.len())
+    };
+
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "Failed to process 1 Binance Futures position reports",
+    );
 }

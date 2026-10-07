@@ -324,6 +324,11 @@ Derive uses the configured session key for authenticated execution:
 `DeriveHttpClient` also exposes HTTP order-entry methods for tooling and tests.
 :::
 
+`LiveNode` fetches single-order, bulk order, fill, and position reports over REST on workers.
+Fill reports then drop trades already delivered over the WebSocket, checked on its main thread
+against current state, so a trade that arrives during collection is not reported twice.
+Startup and post-reconnect mass status bypass these hooks.
+
 Perpetuals, options, and ERC-20 spot pairs all use the Derive Trade module. Spot has no
 separate signing path, and reconciliation treats spot instruments like other instrument
 classes except for the reduce-only guard described below.

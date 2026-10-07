@@ -244,6 +244,11 @@ dYdX nets positions (one position per instrument) at the venue level, so the ada
 | Order status updates | ✓          | Real-time order state changes. |
 | Trade history        | ✓          | Execution and fill reports.    |
 
+`LiveNode` collects single-order, bulk order, fill, and position reports from the Indexer on
+runtime workers. Bulk order reports then drop orders the cache already holds as closed, using
+current cache state on its main thread before reconciliation. Startup and post-reconnect mass
+status bypass these hooks.
+
 ### Contingent orders
 
 | Feature            | Perpetuals | Notes                                            |
