@@ -54,15 +54,14 @@ use nautilus_binance::{
 };
 use nautilus_common::{
     cache::Cache,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::{replace_system_event_sender, set_exec_event_sender},
     messages::{
         ExecutionEvent, ExecutionReport, SystemEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-            GenerateOrderStatusReport, GenerateOrderStatusReportBuilder,
-            GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
-            QueryOrder, SubmitOrder, SubmitOrderList,
+            GenerateOrderStatusReportBuilder, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList,
         },
         system::SocketState,
     },
@@ -83,7 +82,6 @@ use nautilus_model::{
         stubs::{crypto_perpetual_ethusdt, currency_pair_btcusdt},
     },
     orders::{LimitOrder, Order, OrderAny, OrderList, StopLimitOrder, stubs::TestOrderEventStubs},
-    reports::{FillReport, OrderStatusReport},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -1875,8 +1873,8 @@ async fn test_mass_status_respects_explicit_instrument_scope(
 }
 
 #[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_single_order_probe_rejects_excluded_instrument(#[values(false, true)] worker: bool) {
+#[tokio::test]
+async fn test_single_order_probe_rejects_excluded_instrument() {
     let config = BinanceExecutionClientConfig {
         api_key: Some("test_api_key".into()),
         api_secret: Some("test_api_secret".into()),
@@ -1896,7 +1894,7 @@ async fn test_single_order_probe_rejects_excluded_instrument(#[values(false, tru
         .build()
         .unwrap();
 
-    let result = generate_order_report(&client, &cmd, worker).await;
+    let result = client.generate_order_status_report(&cmd).await;
 
     assert_eq!(
         result.unwrap_err().to_string(),
@@ -1976,10 +1974,8 @@ async fn test_generate_mass_status_rejects_overflowing_lookback() {
 }
 
 #[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_generate_fill_reports_uses_supported_order_cursor_query(
-    #[values(false, true)] worker: bool,
-) {
+#[tokio::test]
+async fn test_generate_fill_reports_uses_supported_order_cursor_query() {
     let (addr, captured_queries) =
         start_exec_test_server_with_fill_fixture(FillFixtureMode::Paginated).await;
     let base_url = format!("http://{addr}");
@@ -2004,7 +2000,7 @@ async fn test_generate_fill_reports_uses_supported_order_cursor_query(
         None,
     );
 
-    let reports = generate_fills(&client, command, worker).await.unwrap();
+    let reports = client.generate_fill_reports(command).await.unwrap();
     let queries = captured_queries.lock();
 
     assert_eq!(reports.len(), 1_001);
@@ -2030,10 +2026,8 @@ async fn test_generate_fill_reports_uses_supported_order_cursor_query(
 }
 
 #[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_generate_fill_reports_rejects_reversed_time_range(
-    #[values(false, true)] worker: bool,
-) {
+#[tokio::test]
+async fn test_generate_fill_reports_rejects_reversed_time_range() {
     let (addr, captured_queries) =
         start_exec_test_server_with_fill_fixture(FillFixtureMode::Stable).await;
     let base_url = format!("http://{addr}");
@@ -2058,7 +2052,7 @@ async fn test_generate_fill_reports_rejects_reversed_time_range(
         None,
     );
 
-    let error = generate_fills(&client, command, worker).await.unwrap_err();
+    let error = client.generate_fill_reports(command).await.unwrap_err();
 
     assert_eq!(
         error.to_string(),
@@ -4531,176 +4525,5 @@ async fn test_tagged_lookup_failure_is_rejected_before_submission(
             .await
             .iter()
             .any(|method| method == "order.cancelReplace" || method == "order.cancel")
-    );
-}
-
-async fn run_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
-    let core_thread = std::thread::current().id();
-    tokio::spawn(async move {
-        assert_ne!(std::thread::current().id(), core_thread);
-        task.collection.await;
-    })
-    .await
-    .unwrap();
-
-    task.result.await
-}
-
-async fn generate_order_report(
-    client: &BinanceSpotExecutionClient,
-    cmd: &GenerateOrderStatusReport,
-    worker: bool,
-) -> anyhow::Result<Option<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_report(cmd).await
-    }
-}
-
-async fn generate_order_reports(
-    client: &BinanceSpotExecutionClient,
-    cmd: &GenerateOrderStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_reports(cmd).await
-    }
-}
-
-async fn generate_fills(
-    client: &BinanceSpotExecutionClient,
-    cmd: GenerateFillReports,
-    worker: bool,
-) -> anyhow::Result<Vec<FillReport>> {
-    if worker {
-        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
-    } else {
-        client.generate_fill_reports(cmd).await
-    }
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_order_status_report_task_matches_inline_not_found(
-    #[values(false, true)] worker: bool,
-) {
-    let addr = start_exec_test_server().await;
-    let (mut client, _rx, cache) = create_test_execution_client(format!("http://{addr}"));
-    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
-    client.start().unwrap();
-    client.connect().await.unwrap();
-
-    let cmd = GenerateOrderStatusReportBuilder::default()
-        .ts_init(UnixNanos::default())
-        .instrument_id(Some(test_instrument_id()))
-        .client_order_id(Some(ClientOrderId::new("missing-spot-order")))
-        .venue_order_id(Some(VenueOrderId::new("98765")))
-        .build()
-        .unwrap();
-
-    let report = generate_order_report(&client, &cmd, worker).await.unwrap();
-
-    assert!(report.is_none());
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_order_status_reports_task_matches_inline() {
-    let (addr, _captured_queries) =
-        start_exec_test_server_with_fill_fixture(FillFixtureMode::StableWithOpenOrder).await;
-    let (mut client, _rx, cache) = create_test_execution_client(format!("http://{addr}"));
-    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
-    client.start().unwrap();
-    client.connect().await.unwrap();
-
-    let cmd = GenerateOrderStatusReports::new(
-        nautilus_core::UUID4::new(),
-        UnixNanos::default(),
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let summarize = |reports: Vec<OrderStatusReport>| {
-        reports
-            .into_iter()
-            .map(|report| {
-                (
-                    report.account_id,
-                    report.instrument_id,
-                    report.venue_order_id,
-                    report.client_order_id,
-                    report.order_status,
-                    report.quantity,
-                    report.filled_qty,
-                    report.price,
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let inline = summarize(generate_order_reports(&client, &cmd, false).await.unwrap());
-    let worker = summarize(generate_order_reports(&client, &cmd, true).await.unwrap());
-
-    assert_eq!(inline.len(), 1);
-    assert_eq!(inline[0].2, VenueOrderId::from("12345"));
-    assert_eq!(worker, inline);
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_order_status_reports_task_requires_instrument_for_history(
-    #[values(false, true)] worker: bool,
-) {
-    let addr = start_exec_test_server().await;
-    let (client, _rx, _cache) = create_test_execution_client(format!("http://{addr}"));
-    let cmd = GenerateOrderStatusReports::new(
-        nautilus_core::UUID4::new(),
-        UnixNanos::default(),
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    let error = generate_order_reports(&client, &cmd, worker)
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        error.to_string(),
-        "instrument_id is required when open_only=false"
-    );
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_position_status_reports_task_uses_inline_path() {
-    let addr = start_exec_test_server().await;
-    let (client, _rx, _cache) = create_test_execution_client(format!("http://{addr}"));
-    let cmd = GeneratePositionStatusReports::new(
-        nautilus_core::UUID4::new(),
-        UnixNanos::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    assert!(client.generate_position_status_reports_task(&cmd).is_none());
-    assert!(
-        client
-            .generate_position_status_reports(&cmd)
-            .await
-            .unwrap()
-            .is_empty()
     );
 }

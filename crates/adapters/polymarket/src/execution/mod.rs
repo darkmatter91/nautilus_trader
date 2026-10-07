@@ -38,7 +38,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
@@ -441,40 +441,15 @@ impl ExecutionClient for PolymarketExecutionClient {
         self.disconnect_client().await
     }
 
-    fn generate_order_status_report_task(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
-        Some(self.order_status_report_task(cmd))
-    }
-
-    fn generate_order_status_reports_task(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
-        Some(self.order_status_reports_task(cmd))
-    }
-
-    fn generate_fill_reports_task(
-        &self,
-        cmd: &GenerateFillReports,
-    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
-        Some(self.fill_reports_task(cmd))
-    }
-
-    fn generate_position_status_reports_task(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
-        Some(self.position_status_reports_task(cmd))
-    }
-
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
         gate_report(
-            report_gate(&self.settlement, cmd.instrument_id, "order status report"),
+            || {
+                self.settlement
+                    .ensure_resolved(cmd.instrument_id, "order status report")
+            },
             Box::pin(self.generate_order_status_report_impl(cmd)),
         )
         .await
@@ -485,8 +460,11 @@ impl ExecutionClient for PolymarketExecutionClient {
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         gate_report(
-            report_gate(&self.settlement, cmd.instrument_id, "order status reports"),
-            Box::pin(self.generate_order_status_reports_impl(cmd)),
+            || {
+                self.settlement
+                    .ensure_resolved(cmd.instrument_id, "order status reports")
+            },
+            self.generate_order_status_reports_impl(cmd),
         )
         .await
     }
@@ -495,9 +473,17 @@ impl ExecutionClient for PolymarketExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
+        let (instrument_id, venue_order_id) = (cmd.instrument_id, cmd.venue_order_id);
         gate_report(
-            fill_report_gate(&self.settlement, &cmd),
-            Box::pin(self.generate_fill_reports_impl(cmd)),
+            || match venue_order_id {
+                Some(venue_order_id) => self
+                    .settlement
+                    .ensure_order_resolved(&venue_order_id, "fill reports"),
+                None => self
+                    .settlement
+                    .ensure_resolved(instrument_id, "fill reports"),
+            },
+            self.generate_fill_reports_impl(cmd),
         )
         .await
     }
@@ -507,12 +493,11 @@ impl ExecutionClient for PolymarketExecutionClient {
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
         gate_report(
-            report_gate(
-                &self.settlement,
-                cmd.instrument_id,
-                "position status reports",
-            ),
-            Box::pin(self.generate_position_status_reports_impl(cmd)),
+            || {
+                self.settlement
+                    .ensure_resolved(cmd.instrument_id, "position status reports")
+            },
+            self.generate_position_status_reports_impl(cmd),
         )
         .await
     }
@@ -526,29 +511,6 @@ impl ExecutionClient for PolymarketExecutionClient {
             self.generate_mass_status_impl(lookback_mins),
         )
         .await
-    }
-}
-
-/// Returns the settlement gate for a report scoped to an optional instrument.
-fn report_gate(
-    settlement: &Arc<SettlementRegistry>,
-    instrument_id: Option<InstrumentId>,
-    report: &'static str,
-) -> impl Fn() -> anyhow::Result<()> + 'static {
-    let settlement = Arc::clone(settlement);
-    move || settlement.ensure_resolved(instrument_id, report)
-}
-
-/// Returns the settlement gate for fill reports, scoped to the target venue order when given.
-fn fill_report_gate(
-    settlement: &Arc<SettlementRegistry>,
-    cmd: &GenerateFillReports,
-) -> impl Fn() -> anyhow::Result<()> + 'static {
-    let settlement = Arc::clone(settlement);
-    let (instrument_id, venue_order_id) = (cmd.instrument_id, cmd.venue_order_id);
-    move || match venue_order_id {
-        Some(venue_order_id) => settlement.ensure_order_resolved(&venue_order_id, "fill reports"),
-        None => settlement.ensure_resolved(instrument_id, "fill reports"),
     }
 }
 

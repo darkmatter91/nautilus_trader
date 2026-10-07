@@ -42,13 +42,12 @@ use axum::{
 };
 use nautilus_common::{
     cache::Cache,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::{replace_system_event_sender, set_exec_event_sender},
     messages::{
         ExecutionEvent, SystemEvent,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            BatchCancelOrders, CancelAllOrders, CancelOrder, GeneratePositionStatusReports,
             ModifyOrder, SubmitOrder,
         },
         system::SocketState,
@@ -73,7 +72,6 @@ use nautilus_model::{
     events::{AccountState, OrderEventAny},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     orders::{Order, OrderAny, OrderTestBuilder},
-    reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -140,21 +138,15 @@ struct TestServerState {
     command_request_count: Arc<AtomicUsize>,
     command_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
     command_request_texts: Arc<tokio::sync::Mutex<Vec<String>>>,
-    report_requests: Arc<tokio::sync::Mutex<Vec<String>>>,
-    fail_reports: Arc<AtomicBool>,
 }
 
 async fn handle_jsonrpc_request(
-    State(state): State<TestServerState>,
+    State(_state): State<TestServerState>,
     Json(request): Json<Value>,
 ) -> impl IntoResponse {
     let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = request.get("id").and_then(|i| i.as_u64()).unwrap_or(0);
     let params = request.get("params").cloned();
-
-    if let Some(response) = handle_report_request(&state, method, id, params.as_ref()).await {
-        return response;
-    }
 
     match method {
         "public/get_instruments" => handle_get_instruments(id, params).await,
@@ -165,6 +157,11 @@ async fn handle_jsonrpc_request(
         }
         "private/get_account_summaries" => {
             let mut data = load_json("http_get_account_summaries.json");
+            data["id"] = json!(id);
+            Json(data).into_response()
+        }
+        "private/get_positions" => {
+            let mut data = load_json("http_get_positions.json");
             data["id"] = json!(id);
             Json(data).into_response()
         }
@@ -179,175 +176,6 @@ async fn handle_jsonrpc_request(
         }))
         .into_response(),
     }
-}
-
-const REPORT_OPEN_ORDER_ID: &str = "BTC-OPEN-1";
-const REPORT_CLOSED_ORDER_ID: &str = "BTC-CLOSED-1";
-const REPORT_OPEN_CLIENT_ORDER_ID: &str = "O-REPORT-OPEN";
-const REPORT_CLOSED_CLIENT_ORDER_ID: &str = "O-REPORT-CLOSED";
-const REPORT_OPEN_TS_MS: u64 = 1_700_000_010_000;
-const REPORT_CLOSED_TS_MS: u64 = 1_700_000_000_000;
-
-fn report_order(order_id: &str, label: &str, order_state: &str, ts_ms: u64) -> Value {
-    let mut order = load_json("ws_order_buy_response.json")["result"]["order"].clone();
-    order["order_id"] = json!(order_id);
-    order["label"] = json!(label);
-    order["instrument_name"] = json!("BTC-PERPETUAL");
-    order["price"] = json!(50000.0);
-    order["amount"] = json!(10.0);
-    order["contracts"] = json!(1.0);
-    order["order_state"] = json!(order_state);
-    order["creation_timestamp"] = json!(ts_ms);
-    order["last_update_timestamp"] = json!(ts_ms);
-    if order_state == "filled" {
-        order["filled_amount"] = json!(10.0);
-        order["average_price"] = json!(50000.0);
-    }
-    order
-}
-
-fn report_open_order() -> Value {
-    report_order(
-        REPORT_OPEN_ORDER_ID,
-        REPORT_OPEN_CLIENT_ORDER_ID,
-        "open",
-        REPORT_OPEN_TS_MS,
-    )
-}
-
-fn report_closed_order() -> Value {
-    report_order(
-        REPORT_CLOSED_ORDER_ID,
-        REPORT_CLOSED_CLIENT_ORDER_ID,
-        "filled",
-        REPORT_CLOSED_TS_MS,
-    )
-}
-
-fn report_trade(trade_id: &str, order_id: &str, label: &str, ts_ms: u64) -> Value {
-    let mut trade = load_json("ws_user_trades_exact.json")["params"]["data"][0].clone();
-    trade["trade_id"] = json!(trade_id);
-    trade["order_id"] = json!(order_id);
-    trade["label"] = json!(label);
-    trade["instrument_name"] = json!("BTC-PERPETUAL");
-    trade["price"] = json!(50000.0);
-    trade["amount"] = json!(10.0);
-    trade["fee"] = json!(0.0000025);
-    trade["index_price"] = json!(50000.0);
-    trade["mark_price"] = json!(50000.0);
-    trade["profit_loss"] = json!(0.0);
-    trade["timestamp"] = json!(ts_ms);
-    trade
-}
-
-fn report_trades() -> Value {
-    json!([
-        report_trade(
-            "BTC-TRADE-1",
-            REPORT_CLOSED_ORDER_ID,
-            REPORT_CLOSED_CLIENT_ORDER_ID,
-            REPORT_CLOSED_TS_MS,
-        ),
-        report_trade(
-            "BTC-TRADE-2",
-            REPORT_OPEN_ORDER_ID,
-            REPORT_OPEN_CLIENT_ORDER_ID,
-            REPORT_OPEN_TS_MS,
-        ),
-    ])
-}
-
-fn jsonrpc_result(id: u64, result: Value) -> Response {
-    let mut response = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "testnet": true
-    });
-    response["result"] = result;
-    Json(response).into_response()
-}
-
-fn jsonrpc_error(id: u64, code: i64, message: &str) -> Response {
-    Json(json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message
-        },
-        "testnet": true
-    }))
-    .into_response()
-}
-
-async fn handle_report_request(
-    state: &TestServerState,
-    method: &str,
-    id: u64,
-    params: Option<&Value>,
-) -> Option<Response> {
-    let param = |key: &str| {
-        params
-            .and_then(|params| params.get(key))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
-    let is_btc = || param("currency").as_deref() == Some("BTC");
-    let is_report_method = matches!(
-        method,
-        "private/get_order_state"
-            | "private/get_open_orders"
-            | "private/get_open_orders_by_instrument"
-            | "private/get_order_history_by_instrument"
-            | "private/get_order_history_by_currency"
-            | "private/get_user_trades_by_instrument_and_time"
-            | "private/get_user_trades_by_currency_and_time"
-            | "private/get_positions"
-    );
-
-    if !is_report_method {
-        return None;
-    }
-
-    state.report_requests.lock().await.push(method.to_string());
-
-    if state.fail_reports.load(Ordering::Relaxed) {
-        return Some(jsonrpc_error(id, 11044, "not_open_order"));
-    }
-
-    let response = match method {
-        "private/get_order_state" => match param("order_id").as_deref() {
-            Some(REPORT_OPEN_ORDER_ID) => jsonrpc_result(id, report_open_order()),
-            Some(REPORT_CLOSED_ORDER_ID) => jsonrpc_result(id, report_closed_order()),
-            _ => jsonrpc_error(id, 11044, "not_open_order"),
-        },
-        "private/get_open_orders" | "private/get_open_orders_by_instrument" => {
-            jsonrpc_result(id, json!([report_open_order()]))
-        }
-        "private/get_order_history_by_instrument" => {
-            jsonrpc_result(id, json!([report_closed_order()]))
-        }
-        "private/get_order_history_by_currency" if is_btc() => {
-            jsonrpc_result(id, json!([report_closed_order()]))
-        }
-        "private/get_order_history_by_currency" => jsonrpc_result(id, json!([])),
-        "private/get_user_trades_by_instrument_and_time" => {
-            jsonrpc_result(id, json!({"trades": report_trades(), "has_more": false}))
-        }
-        "private/get_user_trades_by_currency_and_time" if is_btc() => {
-            jsonrpc_result(id, json!({"trades": report_trades(), "has_more": false}))
-        }
-        "private/get_user_trades_by_currency_and_time" => {
-            jsonrpc_result(id, json!({"trades": [], "has_more": false}))
-        }
-        _ => {
-            let mut data = load_json("http_get_positions.json");
-            data["id"] = json!(id);
-            Json(data).into_response()
-        }
-    };
-
-    Some(response)
 }
 
 async fn handle_get_instruments(id: u64, params: Option<Value>) -> Response {
@@ -927,115 +755,9 @@ async fn test_exec_client_connect_emits_account_state() {
     client.disconnect().await.unwrap();
 }
 
-async fn run_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
-    let ExecutionReportTask { collection, result } = task;
-    let core_thread = std::thread::current().id();
-    nautilus_common::live::get_runtime()
-        .spawn(async move {
-            assert_ne!(std::thread::current().id(), core_thread);
-            collection.await;
-        })
-        .await
-        .unwrap();
-
-    result.await
-}
-
-async fn generate_order_report(
-    client: &DeribitExecutionClient,
-    cmd: &GenerateOrderStatusReport,
-    worker: bool,
-) -> anyhow::Result<Option<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_report(cmd).await
-    }
-}
-
-async fn generate_order_reports(
-    client: &DeribitExecutionClient,
-    cmd: &GenerateOrderStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_reports(cmd).await
-    }
-}
-
-async fn generate_fills(
-    client: &DeribitExecutionClient,
-    cmd: GenerateFillReports,
-    worker: bool,
-) -> anyhow::Result<Vec<FillReport>> {
-    if worker {
-        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
-    } else {
-        client.generate_fill_reports(cmd).await
-    }
-}
-
-async fn generate_positions(
-    client: &DeribitExecutionClient,
-    cmd: &GeneratePositionStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
-    if worker {
-        run_report_task(client.generate_position_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_position_status_reports(cmd).await
-    }
-}
-
-// Report IDs and init timestamps are generated per call, so parity compares everything else
-fn normalized_report_id() -> UUID4 {
-    UUID4::from("2d89666b-1a1e-4a75-b193-4eb3b454c757")
-}
-
-fn normalize_order_report(mut report: OrderStatusReport) -> OrderStatusReport {
-    report.report_id = normalized_report_id();
-    report.ts_init = UnixNanos::default();
-    report
-}
-
-fn normalize_fill_report(mut report: FillReport) -> FillReport {
-    report.report_id = normalized_report_id();
-    report.ts_init = UnixNanos::default();
-    report
-}
-
-fn normalize_position_report(mut report: PositionStatusReport) -> PositionStatusReport {
-    report.report_id = normalized_report_id();
-    report.ts_init = UnixNanos::default();
-    // Deribit positions carry no venue timestamp, so `ts_last` is the receipt time
-    report.ts_last = UnixNanos::default();
-    report
-}
-
-async fn connected_report_client() -> (
-    DeribitExecutionClient,
-    TestServerState,
-    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-) {
-    let (addr, state) = start_test_server().await.unwrap();
-    let (mut client, rx, cache) = create_test_execution_client(addr);
-    add_test_account_to_cache(&cache, AccountId::from("DERIBIT-001"));
-    client.connect().await.unwrap();
-    state.report_requests.lock().await.clear();
-    (client, state, rx)
-}
-
-fn ms_to_nanos(ms: u64) -> UnixNanos {
-    UnixNanos::from(ms * 1_000_000)
-}
-
 #[rstest]
 #[tokio::test]
-async fn test_generate_position_status_reports_with_fractional_leverage(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_position_status_reports_with_fractional_leverage() {
     let (addr, _state) = start_test_server().await.unwrap();
     let (mut client, _rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("DERIBIT-001"));
@@ -1052,7 +774,7 @@ async fn test_generate_position_status_reports_with_fractional_leverage(
         None,
     );
 
-    let reports = generate_positions(&client, &cmd, worker).await.unwrap();
+    let reports = client.generate_position_status_reports(&cmd).await.unwrap();
 
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].account_id, AccountId::from("DERIBIT-001"));
@@ -1062,285 +784,6 @@ async fn test_generate_position_status_reports_with_fractional_leverage(
     assert_eq!(reports[0].signed_decimal_qty, dec!(50));
     assert_eq!(reports[0].venue_position_id, None);
     assert_eq!(reports[0].avg_px_open, Some(dec!(7440.18)));
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::venue_open(None, Some(REPORT_OPEN_ORDER_ID), Some(REPORT_OPEN_CLIENT_ORDER_ID))]
-#[case::venue_closed(
-    None,
-    Some(REPORT_CLOSED_ORDER_ID),
-    Some(REPORT_CLOSED_CLIENT_ORDER_ID)
-)]
-#[case::venue_unknown(None, Some("BTC-UNKNOWN"), None)]
-#[case::client_open(
-    Some(REPORT_OPEN_CLIENT_ORDER_ID),
-    None,
-    Some(REPORT_OPEN_CLIENT_ORDER_ID)
-)]
-#[case::client_closed(
-    Some(REPORT_CLOSED_CLIENT_ORDER_ID),
-    None,
-    Some(REPORT_CLOSED_CLIENT_ORDER_ID)
-)]
-#[case::client_unknown(Some("O-UNKNOWN"), None, None)]
-#[case::no_identifier(None, None, None)]
-#[tokio::test]
-async fn test_generate_order_status_report_task_matches_inline(
-    #[case] client_order_id: Option<&str>,
-    #[case] venue_order_id: Option<&str>,
-    #[case] expected: Option<&str>,
-) {
-    let (mut client, state, _rx) = connected_report_client().await;
-    let cmd = GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(test_instrument_id()),
-        client_order_id.map(ClientOrderId::from),
-        venue_order_id.map(VenueOrderId::from),
-        None,
-        None,
-    );
-
-    let inline = generate_order_report(&client, &cmd, false).await.unwrap();
-    let inline_requests = std::mem::take(&mut *state.report_requests.lock().await);
-    let worker = generate_order_report(&client, &cmd, true).await.unwrap();
-    let worker_requests = state.report_requests.lock().await.clone();
-
-    assert_eq!(
-        inline.as_ref().and_then(|report| report.client_order_id),
-        expected.map(ClientOrderId::from),
-    );
-    assert_eq!(
-        worker.map(normalize_order_report),
-        inline.map(normalize_order_report),
-    );
-    assert_eq!(worker_requests, inline_requests);
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::all(None, None, 1, 1)]
-#[case::start(Some(REPORT_CLOSED_TS_MS + 1), None, 1, 0)]
-#[case::end(None, Some(REPORT_OPEN_TS_MS - 1), 0, 1)]
-#[case::window(Some(REPORT_CLOSED_TS_MS + 1), Some(REPORT_OPEN_TS_MS - 1), 0, 0)]
-#[tokio::test]
-async fn test_generate_order_status_reports_task_matches_inline(
-    #[case] start_ms: Option<u64>,
-    #[case] end_ms: Option<u64>,
-    #[case] expected_open: usize,
-    #[case] expected_closed: usize,
-    #[values(false, true)] open_only: bool,
-    #[values(None, Some("BTC-PERPETUAL.DERIBIT"))] instrument_id: Option<&str>,
-) {
-    let (mut client, state, _rx) = connected_report_client().await;
-    let cmd = GenerateOrderStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        open_only,
-        instrument_id.map(InstrumentId::from),
-        start_ms.map(ms_to_nanos),
-        end_ms.map(ms_to_nanos),
-        None,
-        None,
-    );
-
-    let inline = generate_order_reports(&client, &cmd, false).await.unwrap();
-    let inline_requests = std::mem::take(&mut *state.report_requests.lock().await);
-    let worker = generate_order_reports(&client, &cmd, true).await.unwrap();
-    let worker_requests = state.report_requests.lock().await.clone();
-
-    let expected = expected_open + if open_only { 0 } else { expected_closed };
-    assert_eq!(inline.len(), expected);
-    assert_eq!(
-        worker
-            .into_iter()
-            .map(normalize_order_report)
-            .collect::<Vec<_>>(),
-        inline
-            .into_iter()
-            .map(normalize_order_report)
-            .collect::<Vec<_>>(),
-    );
-    assert_eq!(worker_requests, inline_requests);
-    assert_eq!(
-        inline_requests
-            .iter()
-            .any(|method| method.starts_with("private/get_order_history")),
-        !open_only,
-    );
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::all(None, None, 2)]
-#[case::venue_order(None, Some(REPORT_CLOSED_ORDER_ID), 1)]
-#[case::instrument(Some("BTC-PERPETUAL.DERIBIT"), None, 2)]
-#[case::instrument_venue_order(Some("BTC-PERPETUAL.DERIBIT"), Some(REPORT_OPEN_ORDER_ID), 1)]
-#[case::unknown_venue_order(None, Some("BTC-UNKNOWN"), 0)]
-#[tokio::test]
-async fn test_generate_fill_reports_task_matches_inline(
-    #[case] instrument_id: Option<&str>,
-    #[case] venue_order_id: Option<&str>,
-    #[case] expected: usize,
-) {
-    let (mut client, state, _rx) = connected_report_client().await;
-    let cmd = GenerateFillReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        instrument_id.map(InstrumentId::from),
-        venue_order_id.map(VenueOrderId::from),
-        Some(ms_to_nanos(REPORT_CLOSED_TS_MS)),
-        Some(ms_to_nanos(REPORT_OPEN_TS_MS)),
-        None,
-        None,
-    );
-
-    let inline = generate_fills(&client, cmd.clone(), false).await.unwrap();
-    let inline_requests = std::mem::take(&mut *state.report_requests.lock().await);
-    let worker = generate_fills(&client, cmd, true).await.unwrap();
-    let worker_requests = state.report_requests.lock().await.clone();
-
-    assert_eq!(inline.len(), expected);
-    assert!(
-        inline
-            .iter()
-            .all(|report| venue_order_id.is_none_or(|id| report.venue_order_id.as_str() == id))
-    );
-    assert_eq!(
-        worker
-            .into_iter()
-            .map(normalize_fill_report)
-            .collect::<Vec<_>>(),
-        inline
-            .into_iter()
-            .map(normalize_fill_report)
-            .collect::<Vec<_>>(),
-    );
-    assert_eq!(worker_requests, inline_requests);
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::all(None, 1)]
-#[case::instrument(Some("BTC-PERPETUAL.DERIBIT"), 1)]
-#[case::other_instrument(Some("BTC-27DEC24.DERIBIT"), 0)]
-#[tokio::test]
-async fn test_generate_position_status_reports_task_matches_inline(
-    #[case] instrument_id: Option<&str>,
-    #[case] expected: usize,
-) {
-    let (mut client, _state, _rx) = connected_report_client().await;
-    let cmd = GeneratePositionStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        instrument_id.map(InstrumentId::from),
-        None,
-        None,
-        None,
-        None,
-    );
-
-    let inline = generate_positions(&client, &cmd, false).await.unwrap();
-    let worker = generate_positions(&client, &cmd, true).await.unwrap();
-
-    assert_eq!(inline.len(), expected);
-    assert_eq!(
-        worker
-            .into_iter()
-            .map(normalize_position_report)
-            .collect::<Vec<_>>(),
-        inline
-            .into_iter()
-            .map(normalize_position_report)
-            .collect::<Vec<_>>(),
-    );
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_report_tasks_propagate_venue_errors(#[values(false, true)] worker: bool) {
-    let (mut client, state, _rx) = connected_report_client().await;
-    state.fail_reports.store(true, Ordering::Relaxed);
-
-    let order_cmd = GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(test_instrument_id()),
-        Some(ClientOrderId::from(REPORT_OPEN_CLIENT_ORDER_ID)),
-        None,
-        None,
-        None,
-    );
-    let orders_cmd = GenerateOrderStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let fills_cmd = GenerateFillReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(test_instrument_id()),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let positions_cmd = GeneratePositionStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    assert!(
-        generate_order_report(&client, &order_cmd, worker)
-            .await
-            .is_err()
-    );
-    assert!(
-        generate_order_reports(&client, &orders_cmd, worker)
-            .await
-            .is_err()
-    );
-    assert!(generate_fills(&client, fills_cmd, worker).await.is_err());
-    assert!(
-        generate_positions(&client, &positions_cmd, worker)
-            .await
-            .is_err()
-    );
-
-    // A failed lookup by venue order ID is logged and reported as not found on both paths
-    let venue_cmd = GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(test_instrument_id()),
-        None,
-        Some(VenueOrderId::from(REPORT_OPEN_ORDER_ID)),
-        None,
-        None,
-    );
-    assert!(
-        generate_order_report(&client, &venue_cmd, worker)
-            .await
-            .unwrap()
-            .is_none()
-    );
 
     client.disconnect().await.unwrap();
 }

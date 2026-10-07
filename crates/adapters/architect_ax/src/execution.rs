@@ -17,16 +17,14 @@
 
 use std::{
     future::Future,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use async_trait::async_trait;
-use dashmap::DashMap;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -174,14 +172,6 @@ impl AxExecutionClient {
             pending_tasks,
             shutdown_errors: Vec::new(),
         })
-    }
-
-    fn report_client(&self) -> AxReportClient {
-        AxReportClient {
-            account_id: self.core.account_id,
-            http_client: self.http_client.clone(),
-            cid_to_client_order_id: Arc::clone(self.ws_orders.cid_to_client_order_id()),
-        }
     }
 
     async fn authenticate(&self, credential: &Credential) -> anyhow::Result<SecretString> {
@@ -1099,95 +1089,108 @@ impl ExecutionClient for AxExecutionClient {
         Ok(())
     }
 
-    fn generate_order_status_report_task(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
-        let client = self.report_client();
-        let caches = self.ws_orders.caches().clone();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_order_status_report(&command).await },
-            move |report| Ok(finish_order_status_report(report, &caches)),
-        ))
-    }
-
-    fn generate_order_status_reports_task(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
-        let client = self.report_client();
-        let caches = self.ws_orders.caches().clone();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_order_status_reports(&command).await },
-            move |reports| Ok(finish_order_status_reports(reports, &caches)),
-        ))
-    }
-
-    fn generate_fill_reports_task(
-        &self,
-        cmd: &GenerateFillReports,
-    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_fill_reports(command).await },
-            Ok,
-        ))
-    }
-
-    fn generate_position_status_reports_task(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_position_status_reports(&command).await },
-            Ok,
-        ))
-    }
-
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let report = self
-            .report_client()
-            .collect_order_status_report(cmd)
+        let caches = self.ws_orders.caches().clone();
+        let cid_map = caches.cid_to_client_order_id.clone();
+        let cid_resolver = move |cid: u64| cid_map.get(&cid).map(|v| *v);
+
+        let mut reports = self
+            .http_client
+            .request_order_status_reports(self.core.account_id, Some(cid_resolver))
             .await?;
-        Ok(finish_order_status_report(report, self.ws_orders.caches()))
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            reports.retain(|report| report.instrument_id == instrument_id);
+        }
+
+        if let Some(client_order_id) = cmd.client_order_id {
+            reports.retain(|report| report.client_order_id == Some(client_order_id));
+        }
+
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
+        }
+
+        let report = reports.into_iter().next();
+        if let Some(report) = &report {
+            cleanup_closed_order_status_report(report, &caches);
+        }
+
+        Ok(report)
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let reports = self
-            .report_client()
-            .collect_order_status_reports(cmd)
-            .await?;
-        Ok(finish_order_status_reports(
-            reports,
-            self.ws_orders.caches(),
-        ))
+        let caches = self.ws_orders.caches().clone();
+        let cid_map = caches.cid_to_client_order_id.clone();
+        let cid_resolver = move |cid: u64| cid_map.get(&cid).map(|v| *v);
+
+        let mut reports = if cmd.open_only {
+            self.http_client
+                .request_order_status_reports(self.core.account_id, Some(cid_resolver))
+                .await?
+        } else {
+            self.http_client
+                .request_historical_order_status_reports(
+                    self.core.account_id,
+                    cmd.start,
+                    cmd.end,
+                    Some(cid_resolver),
+                )
+                .await?
+        };
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            reports.retain(|report| report.instrument_id == instrument_id);
+        }
+
+        retain_order_status_reports(&mut reports, cmd);
+        for report in &reports {
+            cleanup_closed_order_status_report(report, &caches);
+        }
+
+        Ok(reports)
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        self.report_client().collect_fill_reports(cmd).await
+        let mut reports = self
+            .http_client
+            .request_fill_reports(self.core.account_id, cmd.start, cmd.end)
+            .await?;
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            reports.retain(|report| report.instrument_id == instrument_id);
+        }
+
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
+        }
+
+        Ok(reports)
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        self.report_client()
-            .collect_position_status_reports(cmd)
-            .await
+        let mut reports = self
+            .http_client
+            .request_position_reports(self.core.account_id)
+            .await?;
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            reports.retain(|report| report.instrument_id == instrument_id);
+        }
+
+        Ok(reports)
     }
 
     async fn generate_mass_status(
@@ -1849,130 +1852,6 @@ pub(crate) fn create_order_rejected(
         false,
         due_post_only,
     ))
-}
-
-/// Owned report collection for runtime workers.
-///
-/// Holds no live cache or execution client state. Collection reads the shared `cid` map to resolve
-/// client order IDs; tracking cleanup for closed reports runs on the core thread when finishing.
-struct AxReportClient {
-    account_id: AccountId,
-    http_client: AxHttpClient,
-    cid_to_client_order_id: Arc<DashMap<u64, ClientOrderId>>,
-}
-
-impl AxReportClient {
-    fn cid_resolver(&self) -> impl Fn(u64) -> Option<ClientOrderId> + use<> {
-        let cid_map = Arc::clone(&self.cid_to_client_order_id);
-        move |cid: u64| cid_map.get(&cid).map(|v| *v)
-    }
-
-    async fn collect_order_status_report(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let mut reports = self
-            .http_client
-            .request_order_status_reports(self.account_id, Some(self.cid_resolver()))
-            .await?;
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            reports.retain(|report| report.instrument_id == instrument_id);
-        }
-
-        if let Some(client_order_id) = cmd.client_order_id {
-            reports.retain(|report| report.client_order_id == Some(client_order_id));
-        }
-
-        if let Some(venue_order_id) = cmd.venue_order_id {
-            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
-        }
-
-        Ok(reports.into_iter().next())
-    }
-
-    async fn collect_order_status_reports(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let mut reports = if cmd.open_only {
-            self.http_client
-                .request_order_status_reports(self.account_id, Some(self.cid_resolver()))
-                .await?
-        } else {
-            self.http_client
-                .request_historical_order_status_reports(
-                    self.account_id,
-                    cmd.start,
-                    cmd.end,
-                    Some(self.cid_resolver()),
-                )
-                .await?
-        };
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            reports.retain(|report| report.instrument_id == instrument_id);
-        }
-
-        retain_order_status_reports(&mut reports, cmd);
-        Ok(reports)
-    }
-
-    async fn collect_fill_reports(
-        &self,
-        cmd: GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        let mut reports = self
-            .http_client
-            .request_fill_reports(self.account_id, cmd.start, cmd.end)
-            .await?;
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            reports.retain(|report| report.instrument_id == instrument_id);
-        }
-
-        if let Some(venue_order_id) = cmd.venue_order_id {
-            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
-        }
-
-        Ok(reports)
-    }
-
-    async fn collect_position_status_reports(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let mut reports = self
-            .http_client
-            .request_position_reports(self.account_id)
-            .await?;
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            reports.retain(|report| report.instrument_id == instrument_id);
-        }
-
-        Ok(reports)
-    }
-}
-
-fn finish_order_status_report(
-    report: Option<OrderStatusReport>,
-    caches: &OrdersCaches,
-) -> Option<OrderStatusReport> {
-    if let Some(report) = &report {
-        cleanup_closed_order_status_report(report, caches);
-    }
-    report
-}
-
-fn finish_order_status_reports(
-    reports: Vec<OrderStatusReport>,
-    caches: &OrdersCaches,
-) -> Vec<OrderStatusReport> {
-    for report in &reports {
-        cleanup_closed_order_status_report(report, caches);
-    }
-    reports
 }
 
 fn cleanup_closed_order_status_report(report: &OrderStatusReport, caches: &OrdersCaches) {

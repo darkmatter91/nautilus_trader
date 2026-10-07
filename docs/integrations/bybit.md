@@ -465,12 +465,6 @@ Upstream references:
 | Order status updates | ✓    | ✓      | ✓       | ✓      | Real-time order state changes. |
 | Trade history        | ✓    | ✓      | ✓       | ✓      | Execution and fill reports.    |
 
-`LiveNode` collects single-order, bulk order, fill, and position reports over HTTP on runtime
-workers, using the configured product types captured when the request starts. Collection needs no
-cache state. Order reports then refresh the order identities used by the private stream on the
-main thread, against the cache state current when collection finishes. Startup and post-reconnect
-mass status bypass these hooks.
-
 ### Contingent orders
 
 | Feature            | Spot | Linear | Inverse | Option | Notes                                  |

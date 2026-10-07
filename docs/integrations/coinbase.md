@@ -672,12 +672,6 @@ Open orders and historical fills are reconciled from REST via
 `generate_order_status_report(s)` and `generate_fill_reports` on connect
 and on the standard reconciliation interval set by `LiveExecutionEngineConfig`.
 
-`LiveNode` collects single-order, bulk order, fill, and position reports over
-REST on runtime workers. Collection applies the same instrument-scope filter
-as the inline methods, using the bootstrap instrument set captured when the
-request starts, and needs no cache state. Startup and post-reconnect mass
-status bypass these hooks.
-
 ## Rate limiting
 
 Coinbase publishes the following limits for the Advanced Trade APIs:

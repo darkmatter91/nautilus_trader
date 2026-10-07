@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use jiff::Timestamp;
 use nautilus_common::{
     cache::InstrumentLookupError,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -258,18 +258,6 @@ impl KrakenSpotExecutionClient {
     #[must_use]
     pub fn emitter(&self) -> &ExecutionEventEmitter {
         &self.emitter
-    }
-
-    fn report_client(&self) -> KrakenSpotReportClient {
-        KrakenSpotReportClient {
-            account_id: self.core.account_id,
-            http: self.http.clone(),
-            spot_account_type: self.config.spot_account_type,
-            use_spot_position_reports: self.config.use_spot_position_reports,
-            spot_positions_quote_currency: Ustr::from(
-                self.config.spot_positions_quote_currency.as_str(),
-            ),
-        }
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -1224,81 +1212,88 @@ impl ExecutionClient for KrakenSpotExecutionClient {
         Ok(())
     }
 
-    fn generate_order_status_report_task(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_order_status_report(&command).await },
-            Ok,
-        ))
-    }
-
-    fn generate_order_status_reports_task(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_order_status_reports(&command).await },
-            Ok,
-        ))
-    }
-
-    fn generate_fill_reports_task(
-        &self,
-        cmd: &GenerateFillReports,
-    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_fill_reports(&command).await },
-            Ok,
-        ))
-    }
-
-    fn generate_position_status_reports_task(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_position_status_reports(&command).await },
-            Ok,
-        ))
-    }
-
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        self.report_client().collect_order_status_report(cmd).await
+        log::debug!(
+            "Generating order status report: venue_order_id={:?}, client_order_id={:?}",
+            cmd.venue_order_id,
+            cmd.client_order_id
+        );
+
+        let account_id = self.core.account_id;
+        let reports = self
+            .http
+            .request_order_status_reports(account_id, None, None, None, false)
+            .await?;
+
+        // Match by venue_order_id or client_order_id (comparing truncated form
+        // since Kraken stores the truncated cl_ord_id for long IDs)
+        Ok(reports.into_iter().find(|r| {
+            cmd.venue_order_id
+                .is_some_and(|id| r.venue_order_id.as_str() == id.as_str())
+                || cmd.client_order_id.is_some_and(|id| {
+                    r.client_order_id
+                        .as_ref()
+                        .is_some_and(|r_id| r_id.as_str() == truncate_cl_ord_id(&id))
+                })
+        }))
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        self.report_client().collect_order_status_reports(cmd).await
+        log::debug!(
+            "Generating order status reports: instrument_id={:?}, open_only={}",
+            cmd.instrument_id,
+            cmd.open_only
+        );
+
+        let account_id = self.core.account_id;
+        let start = cmd.start.map(Timestamp::from);
+        let end = cmd.end.map(Timestamp::from);
+        self.http
+            .request_order_status_reports(account_id, cmd.instrument_id, start, end, cmd.open_only)
+            .await
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        self.report_client().collect_fill_reports(&cmd).await
+        log::debug!(
+            "Generating fill reports: instrument_id={:?}",
+            cmd.instrument_id
+        );
+
+        let account_id = self.core.account_id;
+        let start = cmd.start.map(Timestamp::from);
+        let end = cmd.end.map(Timestamp::from);
+        self.http
+            .request_fill_reports(account_id, cmd.instrument_id, start, end)
+            .await
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        self.report_client()
-            .collect_position_status_reports(cmd)
+        log::debug!(
+            "Generating position status reports: instrument_id={:?}",
+            cmd.instrument_id
+        );
+
+        let account_id = self.core.account_id;
+        self.http
+            .request_position_status_reports(
+                account_id,
+                cmd.instrument_id,
+                self.config.spot_account_type,
+                self.config.use_spot_position_reports,
+                Ustr::from(self.config.spot_positions_quote_currency.as_str()),
+            )
             .await
     }
 
@@ -1656,108 +1651,6 @@ impl ExecutionClient for KrakenSpotExecutionClient {
         });
 
         Ok(())
-    }
-}
-
-/// Owned report collection for the spot client.
-///
-/// Holds no cache or `Rc` state, so report tasks can run it on a runtime worker. The inline
-/// report methods call the same collection, keeping filters, report identity, and errors shared.
-#[derive(Debug)]
-struct KrakenSpotReportClient {
-    account_id: AccountId,
-    http: KrakenSpotHttpClient,
-    spot_account_type: AccountType,
-    use_spot_position_reports: bool,
-    spot_positions_quote_currency: Ustr,
-}
-
-impl KrakenSpotReportClient {
-    async fn collect_order_status_report(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        log::debug!(
-            "Generating order status report: venue_order_id={:?}, client_order_id={:?}",
-            cmd.venue_order_id,
-            cmd.client_order_id
-        );
-
-        let reports = self
-            .http
-            .request_order_status_reports(self.account_id, None, None, None, false)
-            .await?;
-
-        // Match by venue_order_id or client_order_id (comparing truncated form
-        // since Kraken stores the truncated cl_ord_id for long IDs)
-        Ok(reports.into_iter().find(|r| {
-            cmd.venue_order_id
-                .is_some_and(|id| r.venue_order_id.as_str() == id.as_str())
-                || cmd.client_order_id.is_some_and(|id| {
-                    r.client_order_id
-                        .as_ref()
-                        .is_some_and(|r_id| r_id.as_str() == truncate_cl_ord_id(&id))
-                })
-        }))
-    }
-
-    async fn collect_order_status_reports(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        log::debug!(
-            "Generating order status reports: instrument_id={:?}, open_only={}",
-            cmd.instrument_id,
-            cmd.open_only
-        );
-
-        let start = cmd.start.map(Timestamp::from);
-        let end = cmd.end.map(Timestamp::from);
-        self.http
-            .request_order_status_reports(
-                self.account_id,
-                cmd.instrument_id,
-                start,
-                end,
-                cmd.open_only,
-            )
-            .await
-    }
-
-    async fn collect_fill_reports(
-        &self,
-        cmd: &GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        log::debug!(
-            "Generating fill reports: instrument_id={:?}",
-            cmd.instrument_id
-        );
-
-        let start = cmd.start.map(Timestamp::from);
-        let end = cmd.end.map(Timestamp::from);
-        self.http
-            .request_fill_reports(self.account_id, cmd.instrument_id, start, end)
-            .await
-    }
-
-    async fn collect_position_status_reports(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        log::debug!(
-            "Generating position status reports: instrument_id={:?}",
-            cmd.instrument_id
-        );
-
-        self.http
-            .request_position_status_reports(
-                self.account_id,
-                cmd.instrument_id,
-                self.spot_account_type,
-                self.use_spot_position_reports,
-                self.spot_positions_quote_currency,
-            )
-            .await
     }
 }
 

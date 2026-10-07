@@ -20,7 +20,7 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::atomic::Ordering, t
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use nautilus_common::{
     cache::Cache,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     clock::VirtualClock,
     enums::LogLevel,
     live::runner::{replace_system_event_sender, set_exec_event_sender},
@@ -64,7 +64,6 @@ use nautilus_model::{
         stubs::TestOrderEventStubs,
     },
     position::Position,
-    reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_polymarket::{
@@ -8326,7 +8325,6 @@ async fn test_modify_order_ambiguous_replacement_is_recovered_by_order_reconcili
 async fn test_modify_order_ambiguous_replacement_after_fill_void_reconciles_leg(
     #[case] replacement_filled: &str,
     #[case] expected_filled: &str,
-    #[values(false, true)] worker: bool,
 ) {
     let state = TestServerState::default();
     let old_venue_order_id = "0xmodify-replacement-void";
@@ -8498,7 +8496,8 @@ async fn test_modify_order_ambiguous_replacement_after_fill_void_reconciles_leg(
         correlation_id: None,
         causation_id: None,
     };
-    let reports = generate_order_reports(&client, &cache, &generate, worker)
+    let reports = client
+        .generate_order_status_reports(&generate)
         .await
         .unwrap();
 
@@ -8514,7 +8513,8 @@ async fn test_modify_order_ambiguous_replacement_after_fill_void_reconciles_leg(
 
     // Once the cache holds the replacement, its venue leg is expected to be the 8 submitted
     cache.borrow_mut().update_order(&updated_event).unwrap();
-    let reports = generate_order_reports(&client, &cache, &generate, worker)
+    let reports = client
+        .generate_order_status_reports(&generate)
         .await
         .unwrap();
 
@@ -8529,7 +8529,6 @@ async fn test_modify_order_ambiguous_replacement_after_fill_void_reconciles_leg(
 #[tokio::test]
 async fn test_modify_order_suppresses_old_leg_rest_cancel_during_replacement_submission(
     #[case] recover_missing_order: bool,
-    #[values(false, true)] worker: bool,
 ) {
     let state = TestServerState::default();
     let old_venue_order_id = "0xmodify-rest-cancel";
@@ -8593,10 +8592,8 @@ async fn test_modify_order_suppresses_old_leg_rest_cancel_during_replacement_sub
         *state.single_order_response.lock().await = Some(Value::Null);
     }
 
-    let generated = generate_order_report(
-        &client,
-        &cache,
-        &GenerateOrderStatusReport {
+    let generated = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
             command_id: UUID4::new(),
             ts_init: UnixNanos::default(),
             instrument_id: Some(instrument_id),
@@ -8605,11 +8602,9 @@ async fn test_modify_order_suppresses_old_leg_rest_cancel_during_replacement_sub
             params: None,
             correlation_id: None,
             causation_id: None,
-        },
-        worker,
-    )
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
 
     client
         .query_order(QueryOrder::new(
@@ -18343,542 +18338,4 @@ async fn test_query_account_does_not_block_within_runtime() {
         "Expected Account event, was {event:?}"
     );
     assert_eq!(state.orders_get_count.load(Ordering::Acquire), 0);
-}
-
-/// Runs report collection on a runtime task while the live cache is mutably borrowed, so any
-/// cache access during collection panics, then finishes on the calling thread.
-#[expect(
-    clippy::await_holding_refcell_ref,
-    reason = "worker report collection must not access the borrowed live cache"
-)]
-async fn run_report_task<T>(
-    task: ExecutionReportTask<T>,
-    cache: &Rc<RefCell<Cache>>,
-) -> anyhow::Result<T> {
-    let core_thread = std::thread::current().id();
-    let multi_thread = tokio::runtime::Handle::current().runtime_flavor()
-        == tokio::runtime::RuntimeFlavor::MultiThread;
-    let cache_borrow = cache.borrow_mut();
-    tokio::spawn(async move {
-        if multi_thread {
-            assert_ne!(std::thread::current().id(), core_thread);
-        }
-        task.collection.await;
-    })
-    .await
-    .unwrap();
-    drop(cache_borrow);
-
-    task.result.await
-}
-
-async fn generate_order_report(
-    client: &PolymarketExecutionClient,
-    cache: &Rc<RefCell<Cache>>,
-    cmd: &GenerateOrderStatusReport,
-    worker: bool,
-) -> anyhow::Result<Option<OrderStatusReport>> {
-    if worker {
-        run_report_task(
-            client.generate_order_status_report_task(cmd).unwrap(),
-            cache,
-        )
-        .await
-    } else {
-        client.generate_order_status_report(cmd).await
-    }
-}
-
-async fn generate_order_reports(
-    client: &PolymarketExecutionClient,
-    cache: &Rc<RefCell<Cache>>,
-    cmd: &GenerateOrderStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<OrderStatusReport>> {
-    if worker {
-        run_report_task(
-            client.generate_order_status_reports_task(cmd).unwrap(),
-            cache,
-        )
-        .await
-    } else {
-        client.generate_order_status_reports(cmd).await
-    }
-}
-
-async fn generate_fill_reports(
-    client: &PolymarketExecutionClient,
-    cache: &Rc<RefCell<Cache>>,
-    cmd: GenerateFillReports,
-    worker: bool,
-) -> anyhow::Result<Vec<FillReport>> {
-    if worker {
-        run_report_task(client.generate_fill_reports_task(&cmd).unwrap(), cache).await
-    } else {
-        client.generate_fill_reports(cmd).await
-    }
-}
-
-async fn generate_position_reports(
-    client: &PolymarketExecutionClient,
-    cache: &Rc<RefCell<Cache>>,
-    cmd: &GeneratePositionStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
-    if worker {
-        run_report_task(
-            client.generate_position_status_reports_task(cmd).unwrap(),
-            cache,
-        )
-        .await
-    } else {
-        client.generate_position_status_reports(cmd).await
-    }
-}
-
-/// Asserts worker and inline reports match on every field except report identity and init time.
-fn assert_same_reports<T: serde::Serialize>(inline: &[T], worker: &[T]) {
-    let strip = |reports: &[T]| {
-        reports
-            .iter()
-            .map(|report| {
-                let mut value = serde_json::to_value(report).unwrap();
-                let fields = value.as_object_mut().unwrap();
-                if fields.get("ts_last") == fields.get("ts_init") {
-                    fields.remove("ts_last");
-                }
-                fields.remove("report_id");
-                fields.remove("ts_init");
-                value
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(inline.len(), worker.len());
-    assert_eq!(strip(worker), strip(inline));
-}
-
-const REPORT_TASK_VENUE_ORDER_ID: &str =
-    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12";
-
-/// Sets up a matched venue order with confirmed trades for a cached accepted order.
-async fn report_task_client(
-    state: &TestServerState,
-) -> (
-    PolymarketExecutionClient,
-    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    Rc<RefCell<Cache>>,
-    OrderAny,
-) {
-    let mut order = load_json("http_open_orders_page.json")["data"][0].clone();
-    order["id"] = json!(REPORT_TASK_VENUE_ORDER_ID);
-    order["status"] = json!("MATCHED");
-    order["original_size"] = json!("10.0000");
-    order["size_matched"] = json!("10.0000");
-    order["price"] = json!("0.5000");
-    *state.single_order_response.lock().await = Some(order.clone());
-    *state.orders_response_override.lock().await = Some(json!({
-        "data": [order],
-        "next_cursor": "LTE=",
-    }));
-    *state.trades_response_override.lock().await = Some(recovery_trades_response(
-        REPORT_TASK_VENUE_ORDER_ID,
-        "10.0000",
-        "0.5000",
-    ));
-    let addr = start_mock_server(state.clone()).await;
-    let (mut client, rx, cache) = create_test_execution_client(addr);
-
-    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
-    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
-    client.on_instrument(instrument);
-    let mut cached_order = make_limit_order(
-        "O-REPORT-TASK",
-        instrument_id,
-        OrderSide::Buy,
-        false,
-        false,
-        false,
-        TimeInForce::Gtc,
-    );
-    cache
-        .borrow_mut()
-        .add_order(cached_order.clone(), None, None, false)
-        .unwrap();
-    submit_and_accept_order(&cache, &mut cached_order, REPORT_TASK_VENUE_ORDER_ID);
-
-    (client, rx, cache, cached_order)
-}
-
-fn report_task_orders_cmd(open_only: bool) -> GenerateOrderStatusReports {
-    GenerateOrderStatusReports {
-        command_id: UUID4::new(),
-        ts_init: UnixNanos::default(),
-        open_only,
-        instrument_id: Some(InstrumentId::from("TEST-TOKEN.POLYMARKET")),
-        start: None,
-        end: None,
-        params: None,
-        log_receipt_level: LogLevel::Info,
-        correlation_id: None,
-        causation_id: None,
-    }
-}
-
-fn report_task_fills_cmd(venue_order_id: Option<&str>) -> GenerateFillReports {
-    GenerateFillReports {
-        command_id: UUID4::new(),
-        ts_init: UnixNanos::default(),
-        instrument_id: Some(InstrumentId::from("TEST-TOKEN.POLYMARKET")),
-        venue_order_id: venue_order_id.map(VenueOrderId::from),
-        start: None,
-        end: None,
-        params: None,
-        log_receipt_level: LogLevel::Info,
-        correlation_id: None,
-        causation_id: None,
-    }
-}
-
-fn report_task_positions_cmd(instrument_id: Option<InstrumentId>) -> GeneratePositionStatusReports {
-    GeneratePositionStatusReports {
-        command_id: UUID4::new(),
-        ts_init: UnixNanos::default(),
-        instrument_id,
-        start: None,
-        end: None,
-        params: None,
-        log_receipt_level: LogLevel::Info,
-        correlation_id: None,
-        causation_id: None,
-    }
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_report_tasks_match_inline_reports() {
-    let state = TestServerState::default();
-    let (client, _rx, cache, cached_order) = report_task_client(&state).await;
-    let single = GenerateOrderStatusReport {
-        command_id: UUID4::new(),
-        ts_init: UnixNanos::default(),
-        instrument_id: Some(cached_order.instrument_id()),
-        client_order_id: Some(cached_order.client_order_id()),
-        venue_order_id: None,
-        params: None,
-        correlation_id: None,
-        causation_id: None,
-    };
-    let orders = report_task_orders_cmd(false);
-    let fills = report_task_fills_cmd(Some(REPORT_TASK_VENUE_ORDER_ID));
-    let trade_queries = || async { state.trade_queries.lock().await.len() };
-
-    let start = trade_queries().await;
-    let inline_single = generate_order_report(&client, &cache, &single, false)
-        .await
-        .unwrap()
-        .unwrap();
-    let inline_orders = generate_order_reports(&client, &cache, &orders, false)
-        .await
-        .unwrap();
-    let inline_fills = generate_fill_reports(&client, &cache, fills.clone(), false)
-        .await
-        .unwrap();
-    let inline_trade_queries = trade_queries().await - start;
-
-    let start = trade_queries().await;
-    let worker_single = generate_order_report(&client, &cache, &single, true)
-        .await
-        .unwrap()
-        .unwrap();
-    let worker_orders = generate_order_reports(&client, &cache, &orders, true)
-        .await
-        .unwrap();
-    let worker_fills = generate_fill_reports(&client, &cache, fills, true)
-        .await
-        .unwrap();
-    let worker_trade_queries = trade_queries().await - start;
-
-    assert_eq!(
-        inline_single.client_order_id,
-        Some(cached_order.client_order_id())
-    );
-    assert_eq!(inline_single.filled_qty, Quantity::from("10.0000"));
-    assert_eq!(inline_orders.len(), 1);
-    assert_eq!(inline_orders[0].order_status, OrderStatus::Filled);
-    assert_eq!(inline_orders[0].filled_qty, Quantity::from("10.0000"));
-    assert_eq!(inline_fills.len(), 1);
-    assert_same_reports(&[inline_single], &[worker_single]);
-    assert_same_reports(&inline_orders, &worker_orders);
-    assert_same_reports(&inline_fills, &worker_fills);
-
-    // Each venue fill beyond the cached fill confirms trades once per single and bulk report
-    assert_eq!(inline_trade_queries, 3);
-    assert_eq!(worker_trade_queries, inline_trade_queries);
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_position_report_task_matches_inline_reports() {
-    let state = TestServerState::default();
-    *state.positions_response_override.lock().await = Some(json!([{
-        "token_id": TEST_TOKEN_ID,
-        "condition_id": TEST_CONDITION_ID,
-        "current_size": "25.0000",
-        "avg_price": "0.5000",
-    }]));
-    let addr = start_mock_server(state).await;
-    let instrument_id =
-        InstrumentId::from(format!("{TEST_CONDITION_ID}-{TEST_TOKEN_ID}.POLYMARKET").as_str());
-    let (mut client, _rx, cache) = create_test_execution_client(addr);
-    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
-    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
-    client.on_instrument(instrument);
-
-    for cmd in [
-        report_task_positions_cmd(Some(instrument_id)),
-        report_task_positions_cmd(None),
-    ] {
-        let inline = generate_position_reports(&client, &cache, &cmd, false)
-            .await
-            .unwrap();
-        let worker = generate_position_reports(&client, &cache, &cmd, true)
-            .await
-            .unwrap();
-
-        assert_eq!(inline.len(), 1);
-        assert_eq!(inline[0].instrument_id, instrument_id);
-        assert_same_reports(&inline, &worker);
-    }
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_session_position_report_task_fails_like_inline() {
-    let state = TestServerState::default();
-    let addr = start_mock_server(state).await;
-    let mut config = create_test_exec_config(addr);
-    config.signer_type = PolymarketSignerType::Session;
-    config.signature_type = PolymarketSignatureType::Poly1271;
-    config.funder = Some("0x1111111111111111111111111111111111111111".to_string());
-    let (client, _rx, cache) = create_test_execution_client_from_config(config);
-    let cmd = report_task_positions_cmd(None);
-
-    let inline = generate_position_reports(&client, &cache, &cmd, false)
-        .await
-        .unwrap_err();
-    let worker = generate_position_reports(&client, &cache, &cmd, true)
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        inline.to_string(),
-        "Session positions cannot be inferred from wallet-wide holdings"
-    );
-    assert_eq!(format!("{worker:#}"), format!("{inline:#}"));
-}
-
-#[rstest]
-#[case::single_target("single_target")]
-#[case::single("single")]
-#[case::orders("orders")]
-#[case::fills("fills")]
-#[case::positions("positions")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_report_tasks_preserve_errors(#[case] kind: &str) {
-    let state = TestServerState::default();
-    let (client, _rx, cache, cached_order) = report_task_client(&state).await;
-
-    let mut errors = Vec::new();
-    for worker in [false, true] {
-        let error = match kind {
-            "single_target" | "single" => {
-                if kind == "single" {
-                    state
-                        .single_order_response_statuses
-                        .lock()
-                        .await
-                        .push_back(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-                let cmd = GenerateOrderStatusReport {
-                    command_id: UUID4::new(),
-                    ts_init: UnixNanos::default(),
-                    instrument_id: Some(cached_order.instrument_id()),
-                    client_order_id: None,
-                    venue_order_id: (kind == "single")
-                        .then(|| VenueOrderId::from(REPORT_TASK_VENUE_ORDER_ID)),
-                    params: None,
-                    correlation_id: None,
-                    causation_id: None,
-                };
-                generate_order_report(&client, &cache, &cmd, worker)
-                    .await
-                    .unwrap_err()
-            }
-            "orders" => {
-                *state.orders_response_status.lock().await = StatusCode::INTERNAL_SERVER_ERROR;
-                generate_order_reports(&client, &cache, &report_task_orders_cmd(false), worker)
-                    .await
-                    .unwrap_err()
-            }
-            "fills" => {
-                *state.trades_response_override.lock().await = Some(json!({"data": "invalid"}));
-                generate_fill_reports(&client, &cache, report_task_fills_cmd(None), worker)
-                    .await
-                    .unwrap_err()
-            }
-            "positions" => {
-                *state.positions_response_override.lock().await = Some(json!("invalid"));
-                generate_position_reports(&client, &cache, &report_task_positions_cmd(None), worker)
-                    .await
-                    .unwrap_err()
-            }
-            _ => unreachable!(),
-        };
-        errors.push(format!("{error:#}"));
-    }
-
-    let expected = match kind {
-        "single_target" => "generate_order_status_report requires venue_order_id",
-        "single" => "failed to fetch order",
-        "orders" => "failed to fetch orders",
-        "fills" => "failed to fetch trades",
-        "positions" => "failed to fetch positions from Data API",
-        _ => unreachable!(),
-    };
-    assert!(
-        errors[0].starts_with(expected),
-        "unexpected inline error: {}",
-        errors[0]
-    );
-    assert_eq!(errors[1], errors[0]);
-}
-
-#[rstest]
-#[case::venue_unfilled(false)]
-#[case::venue_filled(true)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_order_reports_task_confirms_fills_like_inline(#[case] venue_filled: bool) {
-    let state = TestServerState::default();
-    let (client, _rx, cache, _cached_order) = report_task_client(&state).await;
-
-    if !venue_filled {
-        let mut orders = state.orders_response_override.lock().await;
-        let order = &mut orders.as_mut().unwrap()["data"][0];
-        order["status"] = json!("LIVE");
-        order["size_matched"] = json!("0.0000");
-    }
-
-    let cmd = report_task_orders_cmd(false);
-    let mut results = Vec::new();
-    for worker in [false, true] {
-        let start = state.trade_queries.lock().await.len();
-        let reports = generate_order_reports(&client, &cache, &cmd, worker)
-            .await
-            .unwrap();
-        let queries = state.trade_queries.lock().await.len() - start;
-        results.push((reports, queries));
-    }
-
-    let (inline, inline_queries) = &results[0];
-    let (worker, worker_queries) = &results[1];
-    let expected_filled = if venue_filled { "10.0000" } else { "0.0000" };
-    assert_eq!(inline.len(), 1);
-    assert_eq!(inline[0].filled_qty, Quantity::from(expected_filled));
-    assert_eq!(*inline_queries, usize::from(venue_filled));
-    assert_eq!(worker_queries, inline_queries);
-    assert_same_reports(inline, worker);
-}
-
-/// Without confirmed trades, a venue fill is capped at the cached fill, which the core-thread
-/// continuation reads after collection.
-#[rstest]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_order_reports_task_finishes_with_current_cache_fills() {
-    let state = TestServerState::default();
-    let (client, _rx, cache, cached_order) = report_task_client(&state).await;
-    *state.trades_response_override.lock().await = Some(json!({
-        "data": [],
-        "next_cursor": "LTE=",
-    }));
-    let cmd = report_task_orders_cmd(false);
-
-    let unfilled = generate_order_reports(&client, &cache, &cmd, true)
-        .await
-        .unwrap();
-    assert_eq!(unfilled.len(), 1);
-    assert_eq!(unfilled[0].filled_qty, Quantity::from("0.0000"));
-
-    // The worker collects while the order is unfilled locally, then a fill arrives on the core
-    let task = client.generate_order_status_reports_task(&cmd).unwrap();
-    tokio::spawn(task.collection).await.unwrap();
-    let instrument = cache
-        .borrow()
-        .instrument(&cached_order.instrument_id())
-        .unwrap()
-        .clone();
-    let filled = TestOrderEventStubs::filled(
-        &cached_order,
-        &instrument,
-        Some(TradeId::from("report-task-fill")),
-        None,
-        Some(Price::from("0.5000")),
-        Some(Quantity::from("10.0000")),
-        Some(LiquiditySide::Taker),
-        None,
-        None,
-        Some(AccountId::from("POLYMARKET-001")),
-    );
-    cache.borrow_mut().update_order(&filled).unwrap();
-    let worker = task.result.await.unwrap();
-    let inline = client.generate_order_status_reports(&cmd).await.unwrap();
-
-    assert_eq!(worker.len(), 1);
-    assert_eq!(worker[0].filled_qty, Quantity::from("10.0000"));
-    assert_same_reports(&inline, &worker);
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_order_reports_task_rechecks_settlement_on_core() {
-    let state = TestServerState::default();
-    *state.orders_response_override.lock().await = Some(json!({
-        "data": [],
-        "next_cursor": "LTE=",
-    }));
-    *state.order_response_status.lock().await = StatusCode::INTERNAL_SERVER_ERROR;
-    let addr = start_mock_server(state.clone()).await;
-    let (mut client, mut rx, cache) = create_test_execution_client(addr);
-    client.start().unwrap();
-    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
-    add_instrument_to_cache(&cache, instrument_id);
-    let cmd = report_task_orders_cmd(false);
-
-    // Collection completes before the submit outcome becomes unknown
-    let task = client.generate_order_status_reports_task(&cmd).unwrap();
-    tokio::spawn(task.collection).await.unwrap();
-    submit_single_leg_order_list(
-        &client,
-        &cache,
-        &mut rx,
-        "O-REPORT-TASK-GATE",
-        TimeInForce::Gtc,
-    )
-    .await;
-    wait_until_async(
-        || async { client.generate_order_status_reports(&cmd).await.is_err() },
-        Duration::from_secs(5),
-    )
-    .await;
-    let worker = task.result.await.unwrap_err();
-    let inline = client
-        .generate_order_status_reports(&cmd)
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        inline.to_string(),
-        "cannot generate order status reports: 1 Polymarket order(s) have an unknown submit outcome"
-    );
-    assert_eq!(format!("{worker:#}"), format!("{inline:#}"));
 }

@@ -682,10 +682,6 @@ Live position state is maintained by Nautilus from the fills on `user.trades`, a
 | Order status updates | ✓         | Real-time order state changes. |
 | Trade history        | ✓         | Execution and fill reports.    |
 
-`LiveNode` collects single-order, bulk order, fill, and position reports over HTTP on runtime
-workers. Collection applies the same filters as the inline methods and needs no cache state.
-Startup and post-reconnect mass status bypass these hooks.
-
 ### Contingent orders
 
 | Feature                        | Supported | Notes                                                                          |

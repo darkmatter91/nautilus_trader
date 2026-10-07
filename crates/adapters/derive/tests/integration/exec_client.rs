@@ -46,7 +46,7 @@ use axum::{
 use futures_util::StreamExt;
 use nautilus_common::{
     cache::{Cache, ORDER_NOT_FOUND},
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::{replace_exec_event_sender, replace_system_event_sender},
     messages::{
         ExecutionEvent, SystemEvent,
@@ -84,7 +84,7 @@ use nautilus_model::{
         TraderId, VenueOrderId,
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder},
-    reports::{FillReport, OrderStatusReport, PositionStatusReport},
+    reports::{OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use nautilus_network::{http::HttpClient, websocket::TransportBackend};
@@ -338,8 +338,6 @@ async fn handle_get_trade_history(
                 "subaccount_id": TEST_SUBACCOUNT,
             }
         })
-    } else if response.get("error").is_some() {
-        response
     } else {
         json!({"id": 1, "result": response})
     };
@@ -355,8 +353,6 @@ async fn handle_get_positions(State(state): State<RestState>, body: axum::body::
             "id": 1,
             "result": {"positions": [], "subaccount_id": TEST_SUBACCOUNT}
         })
-    } else if response.get("error").is_some() {
-        response
     } else {
         json!({"id": 1, "result": response})
     };
@@ -5225,81 +5221,9 @@ async fn test_balance_subscription_refreshes_authoritative_account_state() {
     tc.client.disconnect().await.expect("disconnect");
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReportPath {
-    Inline,
-    Worker,
-    QueryOrder,
-}
-
-// Runs the collection on the shared live runtime, off the test (core) thread, then
-// finishes the task on the core thread as `LiveNode` does.
-async fn run_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
-    let core_thread = std::thread::current().id();
-    nautilus_common::live::get_runtime()
-        .spawn(async move {
-            assert_ne!(std::thread::current().id(), core_thread);
-            task.collection.await;
-        })
-        .await
-        .unwrap();
-
-    task.result.await
-}
-
-async fn generate_order_report(
-    client: &DeriveExecutionClient,
-    cmd: &GenerateOrderStatusReport,
-    worker: bool,
-) -> anyhow::Result<Option<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_report(cmd).await
-    }
-}
-
-async fn generate_order_reports(
-    client: &DeriveExecutionClient,
-    cmd: &GenerateOrderStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_reports(cmd).await
-    }
-}
-
-async fn generate_fills(
-    client: &DeriveExecutionClient,
-    cmd: GenerateFillReports,
-    worker: bool,
-) -> anyhow::Result<Vec<FillReport>> {
-    if worker {
-        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
-    } else {
-        client.generate_fill_reports(cmd).await
-    }
-}
-
-async fn generate_positions(
-    client: &DeriveExecutionClient,
-    cmd: &GeneratePositionStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
-    if worker {
-        run_report_task(client.generate_position_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_position_status_reports(cmd).await
-    }
-}
-
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_open_only_includes_trigger_orders(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_reports_open_only_includes_trigger_orders() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     // Distinct payloads so the routing branch is observable.
@@ -5345,7 +5269,9 @@ async fn test_generate_order_status_reports_open_only_includes_trigger_orders(
         None,
         None,
     );
-    let reports = generate_order_reports(&tc.client, &cmd, worker)
+    let reports = tc
+        .client
+        .generate_order_status_reports(&cmd)
         .await
         .expect("reports");
     assert_eq!(reports.len(), 2);
@@ -5363,9 +5289,7 @@ async fn test_generate_order_status_reports_open_only_includes_trigger_orders(
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_history_path_when_not_open_only(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_reports_history_path_when_not_open_only() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.open_orders_response.lock().await = json!({
@@ -5394,7 +5318,9 @@ async fn test_generate_order_status_reports_history_path_when_not_open_only(
         None,
         None,
     );
-    let reports = generate_order_reports(&tc.client, &cmd, worker)
+    let reports = tc
+        .client
+        .generate_order_status_reports(&cmd)
         .await
         .expect("reports");
     assert_eq!(reports.len(), 1);
@@ -5408,9 +5334,7 @@ async fn test_generate_order_status_reports_history_path_when_not_open_only(
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_paginates_across_multiple_pages(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_reports_paginates_across_multiple_pages() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.order_history_pages.lock().await = vec![
@@ -5442,7 +5366,9 @@ async fn test_generate_order_status_reports_paginates_across_multiple_pages(
         None,
         None,
     );
-    let reports = generate_order_reports(&tc.client, &cmd, worker)
+    let reports = tc
+        .client
+        .generate_order_status_reports(&cmd)
         .await
         .expect("reports");
 
@@ -5469,9 +5395,7 @@ async fn test_generate_order_status_reports_paginates_across_multiple_pages(
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_open_only_ignores_time_window(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_reports_open_only_ignores_time_window() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.open_orders_response.lock().await = json!({
@@ -5495,7 +5419,9 @@ async fn test_generate_order_status_reports_open_only_ignores_time_window(
         None,
         None,
     );
-    let reports = generate_order_reports(&tc.client, &cmd, worker)
+    let reports = tc
+        .client
+        .generate_order_status_reports(&cmd)
         .await
         .expect("reports");
     assert_eq!(
@@ -5510,12 +5436,11 @@ async fn test_generate_order_status_reports_open_only_ignores_time_window(
 }
 
 #[rstest]
-#[case::status_report(ReportPath::Inline)]
-#[case::report_task(ReportPath::Worker)]
-#[case::query_order(ReportPath::QueryOrder)]
+#[case::status_report(false)]
+#[case::query_order(true)]
 #[tokio::test]
 async fn test_generate_order_status_report_falls_back_to_history_by_label(
-    #[case] path: ReportPath,
+    #[case] query_order: bool,
 ) {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
@@ -5561,10 +5486,11 @@ async fn test_generate_order_status_report_falls_back_to_history_by_label(
         None,
     );
 
-    let report = if path == ReportPath::QueryOrder {
+    let report = if query_order {
         query_order_report(&mut tc, &cmd).await
     } else {
-        generate_order_report(&tc.client, &cmd, path == ReportPath::Worker)
+        tc.client
+            .generate_order_status_report(&cmd)
             .await
             .expect("report")
             .expect("some")
@@ -5605,12 +5531,11 @@ async fn test_generate_order_status_report_falls_back_to_history_by_label(
 }
 
 #[rstest]
-#[case::status_report(ReportPath::Inline)]
-#[case::report_task(ReportPath::Worker)]
-#[case::query_order(ReportPath::QueryOrder)]
+#[case::status_report(false)]
+#[case::query_order(true)]
 #[tokio::test]
 async fn test_generate_order_status_report_finds_trigger_order_by_label_before_history(
-    #[case] path: ReportPath,
+    #[case] query_order: bool,
 ) {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
@@ -5654,10 +5579,11 @@ async fn test_generate_order_status_report_finds_trigger_order_by_label_before_h
         None,
     );
 
-    let report = if path == ReportPath::QueryOrder {
+    let report = if query_order {
         query_order_report(&mut tc, &cmd).await
     } else {
-        generate_order_report(&tc.client, &cmd, path == ReportPath::Worker)
+        tc.client
+            .generate_order_status_report(&cmd)
             .await
             .expect("report")
             .expect("some")
@@ -5696,9 +5622,7 @@ async fn test_generate_order_status_report_finds_trigger_order_by_label_before_h
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_report_returns_none_on_instrument_mismatch(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_report_returns_none_on_instrument_mismatch() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     // Default get_order response has instrument_name = "ETH-PERP"; ask for BTC.
@@ -5714,7 +5638,9 @@ async fn test_generate_order_status_report_returns_none_on_instrument_mismatch(
         None,
         None,
     );
-    let report = generate_order_report(&tc.client, &cmd, worker)
+    let report = tc
+        .client
+        .generate_order_status_report(&cmd)
         .await
         .expect("report");
     assert!(report.is_none());
@@ -5724,7 +5650,7 @@ async fn test_generate_order_status_report_returns_none_on_instrument_mismatch(
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_filters_by_venue_order_id(#[values(false, true)] worker: bool) {
+async fn test_generate_fill_reports_filters_by_venue_order_id() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.trade_history_response.lock().await = json!({
@@ -5748,9 +5674,7 @@ async fn test_generate_fill_reports_filters_by_venue_order_id(#[values(false, tr
         None,
         None,
     );
-    let reports = generate_fills(&tc.client, cmd, worker)
-        .await
-        .expect("fills");
+    let reports = tc.client.generate_fill_reports(cmd).await.expect("fills");
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].trade_id.as_str(), "trade-b");
     assert_eq!(reports[0].venue_order_id.as_str(), "ord-2");
@@ -5760,9 +5684,7 @@ async fn test_generate_fill_reports_filters_by_venue_order_id(#[values(false, tr
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_position_status_reports_filters_by_instrument(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_position_status_reports_filters_by_instrument() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.positions_response.lock().await = json!({
@@ -5784,223 +5706,14 @@ async fn test_generate_position_status_reports_filters_by_instrument(
         None,
         None,
     );
-    let reports = generate_positions(&tc.client, &cmd, worker)
+    let reports = tc
+        .client
+        .generate_position_status_reports(&cmd)
         .await
         .expect("positions");
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].instrument_id.symbol.as_str(), "ETH-PERP");
     assert_eq!(reports[0].signed_decimal_qty.to_string(), "3");
-
-    tc.client.disconnect().await.expect("disconnect");
-}
-
-fn venue_error() -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "error": {"code": -32000, "message": "Internal error"},
-    })
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_generate_order_status_report_task_matches_inline_venue_error() {
-    let rest_state = RestState::default();
-    *rest_state.get_order_response.lock().await = venue_error();
-    *rest_state.trigger_orders_response.lock().await = venue_error();
-    let mut tc = build_client(rest_state.clone(), WsState::default()).await;
-    tc.client.connect().await.expect("connect succeeds");
-
-    let cmd = GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(InstrumentId::from("ETH-PERP.DERIVE")),
-        None,
-        Some(VenueOrderId::from("ord-missing")),
-        None,
-        None,
-    );
-    let inline = generate_order_report(&tc.client, &cmd, false)
-        .await
-        .unwrap_err();
-    let inline_calls = rest_state.get_order_calls.lock().await.len();
-    let inline_trigger_calls = rest_state.trigger_orders_calls.lock().await.len();
-    let worker = generate_order_report(&tc.client, &cmd, true)
-        .await
-        .unwrap_err();
-
-    assert_eq!(worker.to_string(), inline.to_string());
-    assert_eq!(
-        rest_state.get_order_calls.lock().await.len(),
-        2 * inline_calls
-    );
-    assert_eq!(
-        rest_state.trigger_orders_calls.lock().await.len(),
-        2 * inline_trigger_calls,
-    );
-
-    tc.client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_generate_order_status_reports_task_matches_inline_venue_error() {
-    let rest_state = RestState::default();
-    *rest_state.trigger_orders_response.lock().await = venue_error();
-    let mut tc = build_client(rest_state.clone(), WsState::default()).await;
-    tc.client.connect().await.expect("connect succeeds");
-
-    let cmd = GenerateOrderStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let inline = generate_order_reports(&tc.client, &cmd, false)
-        .await
-        .unwrap_err();
-    let worker = generate_order_reports(&tc.client, &cmd, true)
-        .await
-        .unwrap_err();
-
-    assert_eq!(worker.to_string(), inline.to_string());
-    assert_eq!(rest_state.open_orders_calls.lock().await.len(), 2);
-
-    tc.client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_generate_fill_reports_task_matches_inline_venue_error() {
-    let rest_state = RestState::default();
-    *rest_state.trade_history_response.lock().await = venue_error();
-    let mut tc = build_client(rest_state.clone(), WsState::default()).await;
-    tc.client.connect().await.expect("connect succeeds");
-
-    let cmd = GenerateFillReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let inline = generate_fills(&tc.client, cmd.clone(), false)
-        .await
-        .unwrap_err();
-    let inline_calls = rest_state.trade_history_calls.lock().await.len();
-    let worker = generate_fills(&tc.client, cmd, true).await.unwrap_err();
-
-    assert_eq!(worker.to_string(), inline.to_string());
-    assert_eq!(
-        rest_state.trade_history_calls.lock().await.len(),
-        2 * inline_calls
-    );
-
-    tc.client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_generate_position_status_reports_task_matches_inline_venue_error() {
-    let rest_state = RestState::default();
-    *rest_state.positions_response.lock().await = venue_error();
-    let mut tc = build_client(rest_state.clone(), WsState::default()).await;
-    tc.client.connect().await.expect("connect succeeds");
-
-    let cmd = GeneratePositionStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let inline = generate_positions(&tc.client, &cmd, false)
-        .await
-        .unwrap_err();
-    let inline_calls = rest_state.positions_calls.lock().await.len();
-    let worker = generate_positions(&tc.client, &cmd, true)
-        .await
-        .unwrap_err();
-
-    assert_eq!(worker.to_string(), inline.to_string());
-    assert_eq!(
-        rest_state.positions_calls.lock().await.len(),
-        2 * inline_calls
-    );
-
-    tc.client.disconnect().await.expect("disconnect");
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_generate_fill_reports_task_dedups_ws_trade_delivered_during_collection() {
-    // The task finishes on the core thread against current dedup state, so a trade
-    // the WebSocket delivers after collection but before finalization is dropped.
-    let rest_state = RestState::default();
-    let ws_state = WsState::default();
-    *rest_state.trade_history_response.lock().await = json!({
-        "trades": [
-            sample_trade_json("trade-race-1", "ord-1", "ETH-PERP"),
-            sample_trade_json("trade-race-2", "ord-2", "ETH-PERP"),
-        ],
-        "pagination": {"count": 2, "num_pages": 1},
-        "subaccount_id": TEST_SUBACCOUNT,
-    });
-    let mut tc = build_client(rest_state, ws_state.clone()).await;
-    tc.client.connect().await.expect("connect succeeds");
-
-    wait_until(
-        || {
-            let state = ws_state.clone();
-            async move { !state.subscribe_frames.lock().await.is_empty() }
-        },
-        "subscribe acknowledged",
-    )
-    .await;
-    let _ = drain_until(
-        &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Account(_)),
-        "initial AccountState",
-    )
-    .await;
-
-    let cmd = GenerateFillReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(InstrumentId::from("ETH-PERP.DERIVE")),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let task = tc.client.generate_fill_reports_task(&cmd).unwrap();
-    nautilus_common::live::get_runtime()
-        .spawn(task.collection)
-        .await
-        .unwrap();
-
-    let channel = format!("{TEST_SUBACCOUNT}.trades");
-    let data = json!([sample_trade_json("trade-race-1", "ord-1", "ETH-PERP")]);
-    ws_state.push_notification(make_subscription_frame(&channel, &data));
-    let _ = drain_until(
-        &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Report(ExecutionReport::Fill(_))),
-        "WS FillReport for raced trade",
-    )
-    .await;
-
-    let reports = task.result.await.expect("fills");
-    let trade_ids: Vec<&str> = reports.iter().map(|r| r.trade_id.as_str()).collect();
-    assert_eq!(trade_ids, vec!["trade-race-2"]);
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -6498,9 +6211,7 @@ async fn test_generate_mass_status_prefers_open_order_snapshot_on_overlap() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_report_by_venue_id_uses_get_order(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_report_by_venue_id_uses_get_order() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let mut tc = build_client(rest_state.clone(), ws_state).await;
@@ -6515,7 +6226,9 @@ async fn test_generate_order_status_report_by_venue_id_uses_get_order(
         None,
         None,
     );
-    let report = generate_order_report(&tc.client, &cmd, worker)
+    let report = tc
+        .client
+        .generate_order_status_report(&cmd)
         .await
         .expect("report")
         .expect("some");
@@ -6529,9 +6242,7 @@ async fn test_generate_order_status_report_by_venue_id_uses_get_order(
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_report_by_venue_id_falls_back_to_trigger_orders(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_report_by_venue_id_falls_back_to_trigger_orders() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     *rest_state.get_order_response.lock().await = json!({
@@ -6566,7 +6277,9 @@ async fn test_generate_order_status_report_by_venue_id_falls_back_to_trigger_ord
         None,
         None,
     );
-    let report = generate_order_report(&tc.client, &cmd, worker)
+    let report = tc
+        .client
+        .generate_order_status_report(&cmd)
         .await
         .expect("report")
         .expect("some");
@@ -6741,9 +6454,7 @@ async fn test_ws_trades_dedup_suppresses_repeated_trade_id() {
 
 #[rstest]
 #[tokio::test]
-async fn test_cross_source_dedup_skips_ws_trade_in_generate_fill_reports(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_cross_source_dedup_skips_ws_trade_in_generate_fill_reports() {
     // WS dispatches a fill first; a subsequent HTTP reconciliation pull whose
     // window overlaps the live stream returns the same trade_id. The HTTP
     // path must drop the duplicate so the reconciler does not re-apply a
@@ -6807,9 +6518,7 @@ async fn test_cross_source_dedup_skips_ws_trade_in_generate_fill_reports(
         None,
         None,
     );
-    let reports = generate_fills(&tc.client, cmd, worker)
-        .await
-        .expect("fills");
+    let reports = tc.client.generate_fill_reports(cmd).await.expect("fills");
     assert_eq!(reports.len(), 1, "shared trade must be deduplicated");
     assert_eq!(reports[0].trade_id.as_str(), "trade-fresh-1");
 
@@ -6916,9 +6625,7 @@ async fn test_ws_trades_failed_commission_conversion_does_not_record_dedup() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_skips_unrepresentable_commission_and_retries(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_fill_reports_skips_unrepresentable_commission_and_retries() {
     // The failed row is skipped, not marked processed, so a later poll
     // re-fetches it
     let rest_state = RestState::default();
@@ -6948,7 +6655,9 @@ async fn test_generate_fill_reports_skips_unrepresentable_commission_and_retries
             None,
         )
     };
-    let reports = generate_fills(&tc.client, generate(), worker)
+    let reports = tc
+        .client
+        .generate_fill_reports(generate())
         .await
         .expect("fill generation survives the unrepresentable fee row");
     assert_eq!(reports.len(), 1, "failed row must be skipped");
@@ -6959,7 +6668,9 @@ async fn test_generate_fill_reports_skips_unrepresentable_commission_and_retries
         "pagination": {"count": 1, "num_pages": 1},
         "subaccount_id": TEST_SUBACCOUNT,
     });
-    let retried = generate_fills(&tc.client, generate(), worker)
+    let retried = tc
+        .client
+        .generate_fill_reports(generate())
         .await
         .expect("retry fill generation succeeds");
     assert_eq!(retried.len(), 1);

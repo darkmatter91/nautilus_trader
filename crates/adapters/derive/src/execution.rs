@@ -35,7 +35,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
     cache::ORDER_NOT_FOUND,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::get_exec_event_sender,
     messages::{
         ExecutionReport,
@@ -727,55 +727,6 @@ impl ExecutionClient for DeriveExecutionClient {
         // generic `InstrumentAny` shape published on the bus does not carry
         // those, so the data client populates the cache via
         // [`Self::cache_instrument`] from its bootstrap pass instead.
-    }
-
-    fn generate_order_status_report_task(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
-        let context = self.reconciliation_context();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { context.generate_order_status_report(&command).await },
-            Ok,
-        ))
-    }
-
-    fn generate_order_status_reports_task(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
-        let context = self.reconciliation_context();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { context.generate_order_status_reports(&command, false).await },
-            Ok,
-        ))
-    }
-
-    fn generate_fill_reports_task(
-        &self,
-        cmd: &GenerateFillReports,
-    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
-        let context = self.reconciliation_context();
-        let dispatch_state = Arc::clone(&self.dispatch_state);
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { context.collect_fill_reports(command).await },
-            move |reports| Ok(retain_unseen_fill_reports(&dispatch_state, reports)),
-        ))
-    }
-
-    fn generate_position_status_reports_task(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
-        let context = self.reconciliation_context();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { context.generate_position_status_snapshot(&command).await },
-            |snapshot| Ok(snapshot.reports),
-        ))
     }
 
     async fn generate_order_status_report(
@@ -2195,17 +2146,6 @@ impl DeriveReconciliationContext {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let reports = self.collect_fill_reports(cmd).await?;
-        Ok(retain_unseen_fill_reports(&self.dispatch_state, reports))
-    }
-
-    // Collects fills without consulting the live trade dedup set. Callers apply
-    // `retain_unseen_fill_reports` afterwards, on the core thread for report tasks,
-    // so trades delivered over the WebSocket during collection are still dropped.
-    async fn collect_fill_reports(
-        &self,
-        cmd: GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
         let instrument_name = cmd.instrument_id.map(|id| id.symbol.as_str().to_string());
         let mut page: u32 = 1;
         let mut all_trades: Vec<DeriveTrade> = Vec::new();
@@ -2261,7 +2201,16 @@ impl DeriveReconciliationContext {
                 size_precision,
                 ts_init,
             ) {
-                Ok(Some(report)) => reports.push(report),
+                Ok(Some(report)) => {
+                    if self.dispatch_state.contains_trade(&report.trade_id) {
+                        log::debug!(
+                            "Skipping duplicate Derive fill (trade_id={}) in generate_fill_reports",
+                            report.trade_id,
+                        );
+                        continue;
+                    }
+                    reports.push(report);
+                }
                 Ok(None) => {}
                 Err(e) => log::warn!("Skipping trade in fill report: {e}"),
             }
@@ -2474,26 +2423,6 @@ fn ambiguous_history_client_order_ids(orders: &[DeriveOrder]) -> AHashSet<Client
     }
 
     ambiguous_client_order_ids
-}
-
-fn retain_unseen_fill_reports(
-    dispatch_state: &WsDispatchState,
-    reports: Vec<FillReport>,
-) -> Vec<FillReport> {
-    reports
-        .into_iter()
-        .filter(|report| {
-            if dispatch_state.contains_trade(&report.trade_id) {
-                log::debug!(
-                    "Skipping duplicate Derive fill (trade_id={}) in generate_fill_reports",
-                    report.trade_id,
-                );
-                false
-            } else {
-                true
-            }
-        })
-        .collect()
 }
 
 struct PositionStatusSnapshot {

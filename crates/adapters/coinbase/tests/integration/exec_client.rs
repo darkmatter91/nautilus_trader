@@ -35,15 +35,11 @@ use aws_lc_rs::{
 };
 use axum::{
     Router,
-    extract::{
-        State,
-        ws::{WebSocket, WebSocketUpgrade},
-    },
+    extract::State,
     http::Uri,
-    response::{IntoResponse, Json, Response},
+    response::{IntoResponse, Json},
     routing::{get, post},
 };
-use futures_util::StreamExt;
 use jiff::Timestamp;
 use nautilus_coinbase::{
     common::{
@@ -56,14 +52,12 @@ use nautilus_coinbase::{
 };
 use nautilus_common::{
     cache::Cache,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::replace_exec_event_sender,
     messages::{
         ExecutionEvent,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-            GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GenerateOrderStatusReportsBuilder, GeneratePositionStatusReports,
+            BatchCancelOrders, CancelAllOrders, CancelOrder, GeneratePositionStatusReports,
             GeneratePositionStatusReportsBuilder, ModifyOrder, SubmitOrder, SubmitOrderList,
         },
     },
@@ -72,17 +66,15 @@ use nautilus_common::{
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
-    accounts::{AccountAny, CashAccount, MarginAccount},
-    enums::{AccountType, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
-    events::{AccountState, OrderEventAny},
+    enums::{AccountType, OmsType, OrderSide, OrderType, PositionSide, TimeInForce},
+    events::OrderEventAny,
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TradeId,
-        TraderId, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId,
+        VenueOrderId,
     },
     instruments::InstrumentAny,
     orders::{Order, OrderList, builder::OrderTestBuilder},
-    reports::{FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Money, Price, Quantity},
+    types::{Price, Quantity},
 };
 use nautilus_network::retry::RetryConfig;
 use parking_lot::Mutex;
@@ -206,18 +198,10 @@ impl TestState {
     }
 }
 
-async fn handle_orders_batch(State(state): State<TestState>, uri: Uri) -> Response {
+async fn handle_orders_batch(State(state): State<TestState>, uri: Uri) -> impl IntoResponse {
     let raw_query = uri.query().unwrap_or("").to_string();
-    if state.is_failing("/orders/historical/batch") {
-        state.record_failure("/orders/historical/batch", raw_query, None);
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "unavailable"})),
-        )
-            .into_response();
-    }
     let response = state.next_response("/orders/historical/batch", raw_query);
-    Json(response).into_response()
+    Json(response)
 }
 
 async fn handle_order_by_id(
@@ -231,28 +215,10 @@ async fn handle_order_by_id(
     Json(response)
 }
 
-async fn handle_fills(State(state): State<TestState>, uri: Uri) -> Response {
+async fn handle_fills(State(state): State<TestState>, uri: Uri) -> impl IntoResponse {
     let raw_query = uri.query().unwrap_or("").to_string();
-    if state.is_failing("/orders/historical/fills") {
-        state.record_failure("/orders/historical/fills", raw_query, None);
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "unavailable"})),
-        )
-            .into_response();
-    }
     let response = state.next_response("/orders/historical/fills", raw_query);
-    Json(response).into_response()
-}
-
-// Accepts the user-channel WebSocket and drains client frames so `connect()`
-// can complete and bootstrap the exec client's instrument scope.
-async fn handle_ws_upgrade(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(drain_ws_socket)
-}
-
-async fn drain_ws_socket(mut socket: WebSocket) {
-    while let Some(Ok(_)) = socket.next().await {}
+    Json(response)
 }
 
 async fn handle_accounts(State(state): State<TestState>, uri: Uri) -> impl IntoResponse {
@@ -440,7 +406,6 @@ fn create_router(state: TestState) -> Router {
             &format!("{API_PREFIX}/orders/edit"),
             post(handle_edit_order),
         )
-        .route("/ws", get(handle_ws_upgrade))
         .with_state(state)
 }
 
@@ -1735,7 +1700,6 @@ fn make_exec_client_with_events_and_cache(
         api_key: Some(test_api_key().into()),
         api_secret: Some(test_pem_key().into()),
         base_url_rest: Some(format!("http://{addr}")),
-        base_url_ws: Some(format!("ws://{addr}/ws")),
         account_type,
         ..CoinbaseExecutionClientConfig::default()
     };
@@ -2608,429 +2572,4 @@ async fn test_http_get_products_surfaces_error_on_404() {
         msg.contains("404") || msg.contains("not found") || msg.contains("Not Found"),
         "expected the error to reference the 404 status, was: {err}"
     );
-}
-
-async fn run_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
-    let core_thread = std::thread::current().id();
-    tokio::spawn(async move {
-        assert_ne!(std::thread::current().id(), core_thread);
-        task.collection.await;
-    })
-    .await
-    .unwrap();
-
-    task.result.await
-}
-
-async fn generate_order_report(
-    client: &CoinbaseExecutionClient,
-    cmd: &GenerateOrderStatusReport,
-    worker: bool,
-) -> anyhow::Result<Option<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_report(cmd).await
-    }
-}
-
-async fn generate_order_reports(
-    client: &CoinbaseExecutionClient,
-    cmd: &GenerateOrderStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_reports(cmd).await
-    }
-}
-
-async fn generate_fills(
-    client: &CoinbaseExecutionClient,
-    cmd: GenerateFillReports,
-    worker: bool,
-) -> anyhow::Result<Vec<FillReport>> {
-    if worker {
-        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
-    } else {
-        client.generate_fill_reports(cmd).await
-    }
-}
-
-async fn generate_positions(
-    client: &CoinbaseExecutionClient,
-    cmd: &GeneratePositionStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
-    if worker {
-        run_report_task(client.generate_position_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_position_status_reports(cmd).await
-    }
-}
-
-fn add_test_account_to_cache(
-    cache: &std::rc::Rc<std::cell::RefCell<Cache>>,
-    account_type: AccountType,
-) {
-    let account_state = AccountState::new(
-        AccountId::from("COINBASE-001"),
-        account_type,
-        vec![AccountBalance::new(
-            Money::from("10000.0 USD"),
-            Money::from("0 USD"),
-            Money::from("10000.0 USD"),
-        )],
-        vec![],
-        true,
-        UUID4::new(),
-        UnixNanos::default(),
-        UnixNanos::default(),
-        None,
-    );
-    let account = match account_type {
-        AccountType::Margin => AccountAny::Margin(MarginAccount::new(account_state, true)),
-        _ => AccountAny::Cash(CashAccount::new(account_state, true, false)),
-    };
-    cache.borrow_mut().add_account(account).unwrap();
-}
-
-// Connects the exec client against the mock server so `connect()` bootstraps
-// the instrument scope that report filtering depends on.
-async fn connect_exec_client(
-    state: &TestState,
-    addr: SocketAddr,
-    account_type: AccountType,
-) -> CoinbaseExecutionClient {
-    if account_type == AccountType::Margin {
-        state.enqueue("/market/products", load_json("http_products_future.json"));
-    } else {
-        state.enqueue(
-            "/accounts",
-            json!({
-                "accounts": [account_json("USD", "10000.00", "0", "uuid-1")],
-                "has_next": false,
-                "cursor": "",
-                "size": 1
-            }),
-        );
-    }
-
-    let (mut client, _rx, cache) = make_exec_client_with_events_and_cache(addr, account_type);
-    add_test_account_to_cache(&cache, account_type);
-    client.start().unwrap();
-    client.connect().await.expect("exec client connect");
-    client
-}
-
-fn has_query_pair(raw_query: &str, key: &str, value: &str) -> bool {
-    query_pairs(raw_query)
-        .iter()
-        .any(|(k, v)| k == key && v == value)
-}
-
-fn order_status_reports_cmd(
-    instrument_id: Option<InstrumentId>,
-    open_only: bool,
-) -> GenerateOrderStatusReports {
-    GenerateOrderStatusReportsBuilder::default()
-        .ts_init(UnixNanos::default())
-        .open_only(open_only)
-        .instrument_id(instrument_id)
-        .build()
-        .expect("cmd build")
-}
-
-fn fill_reports_cmd(
-    instrument_id: Option<InstrumentId>,
-    venue_order_id: Option<VenueOrderId>,
-) -> GenerateFillReports {
-    GenerateFillReportsBuilder::default()
-        .ts_init(UnixNanos::default())
-        .instrument_id(instrument_id)
-        .venue_order_id(venue_order_id)
-        .build()
-        .expect("cmd build")
-}
-
-fn order_status_report_cmd(
-    client_order_id: Option<ClientOrderId>,
-    venue_order_id: Option<VenueOrderId>,
-) -> GenerateOrderStatusReport {
-    GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        client_order_id,
-        venue_order_id,
-        None,
-        None,
-    )
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_order_status_reports_filter_to_bootstrapped_scope(
-    #[values(false, true)] open_only: bool,
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    let addr = start_mock_server(state.clone()).await;
-    let mut client = connect_exec_client(&state, addr, AccountType::Cash).await;
-
-    // The derivatives order sits outside the Cash client's spot scope.
-    state.enqueue(
-        "/orders/historical/batch",
-        json!({
-            "orders": [
-                order_json("venue-1", "BTC-USD", "client-1", "OPEN"),
-                order_json("venue-2", "BIP-20DEC30-CDE", "client-2", "OPEN"),
-                order_json("venue-3", "BTC-USD", "client-3", "FILLED"),
-            ],
-            "sequence": "0",
-            "has_next": false,
-            "cursor": ""
-        }),
-    );
-
-    let cmd = order_status_reports_cmd(Some(btc_usd_instrument_id()), open_only);
-    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
-
-    assert_eq!(reports.len(), 2);
-    assert_eq!(reports[0].venue_order_id, VenueOrderId::new("venue-1"));
-    assert_eq!(reports[1].venue_order_id, VenueOrderId::new("venue-3"));
-    assert_eq!(reports[0].account_id, account_id());
-    assert_eq!(reports[0].instrument_id, btc_usd_instrument_id());
-    assert_eq!(
-        reports[0].client_order_id,
-        Some(ClientOrderId::new("client-1"))
-    );
-    assert_eq!(reports[0].order_status, OrderStatus::Accepted);
-    assert_eq!(reports[1].order_status, OrderStatus::Filled);
-
-    let batch_requests = state.requests_for("/orders/historical/batch");
-    assert_eq!(batch_requests.len(), 1);
-    let query = &batch_requests[0].raw_query;
-    assert!(has_query_pair(query, "product_ids", "BTC-USD"));
-    assert_eq!(has_query_pair(query, "order_status", "OPEN"), open_only);
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_order_status_reports_propagate_http_failure(
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    state.mark_failing("/orders/historical/batch");
-    let addr = start_mock_server(state.clone()).await;
-    let client = make_exec_client(addr, AccountType::Cash);
-
-    let cmd = order_status_reports_cmd(None, false);
-    let result = generate_order_reports(&client, &cmd, worker).await;
-
-    assert!(
-        result.is_err(),
-        "503 from /orders/historical/batch must propagate, was {:?}",
-        result.as_ref().map(Vec::len)
-    );
-    assert!(!state.requests_for("/orders/historical/batch").is_empty());
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_fill_reports_filter_to_bootstrapped_scope(
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    let addr = start_mock_server(state.clone()).await;
-    let mut client = connect_exec_client(&state, addr, AccountType::Cash).await;
-
-    state.enqueue(
-        "/orders/historical/fills",
-        json!({
-            "fills": [
-                fill_json("trade-1", "venue-1", "BTC-USD"),
-                fill_json("trade-2", "venue-1", "BIP-20DEC30-CDE"),
-                fill_json("trade-3", "venue-1", "BTC-USD"),
-            ],
-            "cursor": ""
-        }),
-    );
-
-    let cmd = fill_reports_cmd(None, Some(VenueOrderId::new("venue-1")));
-    let reports = generate_fills(&client, cmd, worker).await.unwrap();
-
-    assert_eq!(reports.len(), 2);
-    assert_eq!(reports[0].trade_id, TradeId::new("trade-1"));
-    assert_eq!(reports[1].trade_id, TradeId::new("trade-3"));
-    assert_eq!(reports[0].account_id, account_id());
-    assert_eq!(reports[0].instrument_id, btc_usd_instrument_id());
-    assert_eq!(reports[0].venue_order_id, VenueOrderId::new("venue-1"));
-    assert_eq!(reports[0].last_px, Price::from("45000.00"));
-    assert_eq!(reports[0].last_qty, Quantity::from("0.00100000"));
-
-    let fill_requests = state.requests_for("/orders/historical/fills");
-    assert_eq!(fill_requests.len(), 1);
-    let query = &fill_requests[0].raw_query;
-    assert!(has_query_pair(query, "order_ids", "venue-1"));
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_fill_reports_propagate_http_failure(#[values(false, true)] worker: bool) {
-    let state = TestState::default();
-    state.mark_failing("/orders/historical/fills");
-    let addr = start_mock_server(state.clone()).await;
-    let client = make_exec_client(addr, AccountType::Cash);
-
-    let cmd = fill_reports_cmd(None, None);
-    let result = generate_fills(&client, cmd, worker).await;
-
-    assert!(
-        result.is_err(),
-        "503 from /orders/historical/fills must propagate, was {:?}",
-        result.as_ref().map(Vec::len)
-    );
-    assert!(!state.requests_for("/orders/historical/fills").is_empty());
-}
-
-#[rstest]
-#[case::in_scope("BTC-USD", true)]
-#[case::out_of_scope("BIP-20DEC30-CDE", false)]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_order_status_report_by_venue_order_id(
-    #[case] product_id: &str,
-    #[case] expected: bool,
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    let addr = start_mock_server(state.clone()).await;
-    let mut client = connect_exec_client(&state, addr, AccountType::Cash).await;
-
-    state.enqueue(
-        "/orders/historical/venue-9",
-        json!({"order": order_json("venue-9", product_id, "client-9", "OPEN")}),
-    );
-
-    let cmd = order_status_report_cmd(None, Some(VenueOrderId::new("venue-9")));
-    let report = generate_order_report(&client, &cmd, worker).await.unwrap();
-
-    if expected {
-        let report = report.expect("in-scope report");
-        assert_eq!(report.venue_order_id, VenueOrderId::new("venue-9"));
-        assert_eq!(report.client_order_id, Some(ClientOrderId::new("client-9")));
-        assert_eq!(report.instrument_id, btc_usd_instrument_id());
-        assert_eq!(report.order_status, OrderStatus::Accepted);
-    } else {
-        assert!(report.is_none(), "out-of-scope report must be dropped");
-    }
-    assert_eq!(state.requests_for("/orders/historical/venue-9").len(), 1);
-
-    client.disconnect().await.unwrap();
-}
-
-// The single-order lookup maps venue failures to `Ok(None)`; the worker path
-// must keep that contract rather than surfacing a different error shape.
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_order_status_report_failed_lookup_returns_none(
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    let addr = start_mock_server(state.clone()).await;
-    let client = make_exec_client(addr, AccountType::Cash);
-
-    let missing = order_status_report_cmd(Some(ClientOrderId::new("missing")), None);
-    let report = generate_order_report(&client, &missing, worker)
-        .await
-        .unwrap();
-    assert!(report.is_none());
-    assert_eq!(state.requests_for("/orders/historical/batch").len(), 1);
-
-    let no_identifier = order_status_report_cmd(None, None);
-    let report = generate_order_report(&client, &no_identifier, worker)
-        .await
-        .unwrap();
-    assert!(report.is_none());
-}
-
-#[rstest]
-#[case::list(None, "/cfm/positions", PositionSide::Long)]
-#[case::single(
-    Some(InstrumentId::from("BIP-20DEC30-CDE.COINBASE")),
-    "/cfm/positions/BIP-20DEC30-CDE",
-    PositionSide::Short
-)]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_position_reports_margin(
-    #[case] instrument_id: Option<InstrumentId>,
-    #[case] path: &str,
-    #[case] expected_side: PositionSide,
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    let addr = start_mock_server(state.clone()).await;
-    let client = make_exec_client(addr, AccountType::Margin);
-
-    let cmd = position_status_reports_cmd(instrument_id);
-    let reports = generate_positions(&client, &cmd, worker).await.unwrap();
-
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].account_id, account_id());
-    assert_eq!(
-        reports[0].instrument_id,
-        InstrumentId::from("BIP-20DEC30-CDE.COINBASE")
-    );
-    assert_eq!(reports[0].position_side, expected_side);
-    assert_eq!(state.requests_for(path).len(), 1);
-}
-
-#[rstest]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_position_reports_cash_returns_empty_without_http(
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    let addr = start_mock_server(state.clone()).await;
-    let client = make_exec_client(addr, AccountType::Cash);
-
-    let cmd = position_status_reports_cmd(None);
-    let reports = generate_positions(&client, &cmd, worker).await.unwrap();
-
-    assert!(reports.is_empty());
-    assert!(state.requests().is_empty());
-}
-
-#[rstest]
-#[case::list(None, "/cfm/positions")]
-#[case::single(
-    Some(InstrumentId::from("BIP-20DEC30-CDE.COINBASE")),
-    "/cfm/positions/BIP-20DEC30-CDE"
-)]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_exec_report_position_reports_propagate_http_failure(
-    #[case] instrument_id: Option<InstrumentId>,
-    #[case] path: &str,
-    #[values(false, true)] worker: bool,
-) {
-    let state = TestState::default();
-    state.mark_failing(path);
-    let addr = start_mock_server(state.clone()).await;
-    let client = make_exec_client(addr, AccountType::Margin);
-
-    let cmd = position_status_reports_cmd(instrument_id);
-    let error = generate_positions(&client, &cmd, worker).await.unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .starts_with("failed to request CFM position"),
-        "unexpected error: {error}"
-    );
-    assert!(!state.requests_for(path).is_empty());
 }

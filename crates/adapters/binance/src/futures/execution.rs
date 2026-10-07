@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use nautilus_common::{
     cache::fifo::FifoCache,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     enums::LogLevel,
     live::runner::get_exec_event_sender,
     messages::execution::{
@@ -118,7 +118,7 @@ use crate::{
         symbol::{format_binance_symbol, format_instrument_id},
         urls::{get_usdm_ws_route_base_url, get_ws_private_base_url},
     },
-    config::{BinanceExecutionClientConfig, BinanceInstrumentProviderConfig},
+    config::BinanceExecutionClientConfig,
     futures::{
         conversions::{
             determine_position_side, normalize_futures_asset, reduce_only_param,
@@ -1140,17 +1140,212 @@ impl BinanceFuturesExecutionClient {
         self.config.instrument_provider.excludes(instrument_id)
     }
 
-    fn report_client(&self) -> BinanceFuturesReportClient {
-        BinanceFuturesReportClient {
-            account_id: self.core.account_id,
-            clock: self.clock,
-            http_client: self.http_client.clone(),
-            product_type: self.product_type,
-            instrument_provider: self.config.instrument_provider.clone(),
-            treat_expired_as_canceled: self.config.treat_expired_as_canceled,
-            use_position_ids: self.config.use_position_ids,
-            bnfcr_currency: self.config.bnfcr_currency,
+    /// Creates a position status report from Binance position risk data.
+    fn create_position_report(
+        &self,
+        position: &BinancePositionRisk,
+        instrument_id: InstrumentId,
+        size_precision: u8,
+    ) -> anyhow::Result<PositionStatusReport> {
+        let position_amount: Decimal = position
+            .position_amt
+            .parse()
+            .context("invalid position_amt")?;
+
+        if position_amount.is_zero() {
+            anyhow::bail!("Position is flat");
         }
+
+        let entry_price: Decimal = position
+            .entry_price
+            .parse()
+            .context("invalid entry_price")?;
+
+        let position_side = if position_amount > Decimal::ZERO {
+            PositionSide::Long
+        } else {
+            PositionSide::Short
+        };
+
+        if self.config.use_position_ids {
+            match position.position_side {
+                Some(BinancePositionSide::Long) => anyhow::ensure!(
+                    position_side == PositionSide::Long,
+                    "position_side LONG conflicts with negative position_amt"
+                ),
+                Some(BinancePositionSide::Short) => anyhow::ensure!(
+                    position_side == PositionSide::Short,
+                    "position_side SHORT conflicts with positive position_amt"
+                ),
+                _ => {}
+            }
+        }
+
+        let venue_position_id = make_venue_position_id(
+            self.config.use_position_ids,
+            instrument_id,
+            position.position_side,
+        )?;
+
+        if let Some(venue_position_id) = venue_position_id {
+            self.ensure_cached_position_id_compatible(
+                instrument_id,
+                position_side,
+                venue_position_id,
+            )?;
+        }
+
+        let ts_now = self.clock.get_time_ns();
+
+        Ok(PositionStatusReport::new(
+            self.core.account_id,
+            instrument_id,
+            position_side,
+            Quantity::from_decimal_dp(position_amount.abs(), size_precision)?,
+            ts_now,
+            ts_now,
+            Some(UUID4::new()),
+            venue_position_id,
+            Some(entry_price),
+        ))
+    }
+
+    fn ensure_cached_position_id_compatible(
+        &self,
+        instrument_id: InstrumentId,
+        position_side: PositionSide,
+        venue_position_id: PositionId,
+    ) -> anyhow::Result<()> {
+        let cache = self.core.cache();
+        let mut incompatible_ids: Vec<_> = cache
+            .positions_open(
+                Some(&BINANCE_VENUE),
+                Some(&instrument_id),
+                None,
+                Some(&self.core.account_id),
+                Some(position_side),
+            )
+            .into_iter()
+            .filter(|position| position.id != venue_position_id)
+            .map(|position| position.id.to_string())
+            .collect();
+        incompatible_ids.sort_unstable();
+
+        anyhow::ensure!(
+            incompatible_ids.is_empty(),
+            "incompatible cached {position_side:?} position IDs for {instrument_id}: {}; expected {venue_position_id}",
+            incompatible_ids.join(", "),
+        );
+        Ok(())
+    }
+
+    async fn generate_open_order_status_reports(
+        &self,
+        instrument_id: Option<InstrumentId>,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<Vec<OpenOrderStatusReport>> {
+        if let Some(instrument_id) = instrument_id
+            && self
+                .http_client
+                .instrument_reconciliation(&instrument_id)
+                .is_none()
+        {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope Binance Futures order request for instrument {instrument_id}"
+                );
+                return Ok(Vec::new());
+            }
+
+            anyhow::bail!(
+                "Binance Futures open order request has unresolved instrument {instrument_id}"
+            );
+        }
+
+        let symbol = instrument_id.map(|id| format_binance_symbol(&id));
+        let mut builder = BinanceOpenOrdersParamsBuilder::default();
+
+        if let Some(symbol) = symbol {
+            builder.symbol(symbol);
+        }
+        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let (orders, algo_orders) = tokio::try_join!(
+            self.http_client.query_open_orders(&params),
+            self.http_client.query_open_algo_orders(instrument_id),
+        )?;
+        let mut reports = Vec::with_capacity(orders.len() + algo_orders.len());
+
+        for order in orders {
+            let instrument_id = instrument_id
+                .unwrap_or_else(|| format_instrument_id(&order.symbol, self.product_type));
+            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+            else {
+                if self.is_instrument_out_of_scope(instrument_id) {
+                    log::debug!(
+                        "Dropping out-of-scope Binance Futures open order for instrument {instrument_id}"
+                    );
+                    continue;
+                }
+                anyhow::bail!(
+                    "Binance Futures open order has unresolved instrument {instrument_id}"
+                );
+            };
+
+            let report = order.to_order_status_report(
+                self.core.account_id,
+                instrument.id(),
+                instrument.price_precision(),
+                instrument.size_precision(),
+                self.config.treat_expired_as_canceled,
+                ts_init,
+            )?;
+            let venue_position_id = make_venue_position_id(
+                self.config.use_position_ids,
+                instrument.id(),
+                order.position_side,
+            )?;
+            reports.push(OpenOrderStatusReport {
+                report: with_venue_position_id(report, venue_position_id),
+                quantity_free_close_position_side: None,
+            });
+        }
+
+        for algo_order in algo_orders {
+            let instrument_id = instrument_id
+                .unwrap_or_else(|| format_instrument_id(&algo_order.symbol, self.product_type));
+            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+            else {
+                if self.is_instrument_out_of_scope(instrument_id) {
+                    log::debug!(
+                        "Dropping out-of-scope Binance Futures open algo order for instrument {instrument_id}"
+                    );
+                    continue;
+                }
+                anyhow::bail!(
+                    "Binance Futures open algo order has unresolved instrument {instrument_id}"
+                );
+            };
+
+            let report = algo_order.to_order_status_report(
+                self.core.account_id,
+                instrument.id(),
+                instrument.price_precision(),
+                instrument.size_precision(),
+                ts_init,
+            )?;
+            let venue_position_id = make_venue_position_id(
+                self.config.use_position_ids,
+                instrument.id(),
+                algo_order.position_side,
+            )?;
+            reports.push(OpenOrderStatusReport {
+                report: with_venue_position_id(report, venue_position_id),
+                quantity_free_close_position_side: quantity_free_close_position_side(&algo_order),
+            });
+        }
+
+        Ok(reports)
     }
 
     async fn apply_futures_config(&self) -> anyhow::Result<()> {
@@ -2119,98 +2314,573 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
         Ok(())
     }
 
-    fn generate_order_status_report_task(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
-        let client = self.report_client();
-        let algo_lookup = self.resolve_algo_lookup(cmd.client_order_id, cmd.params.as_ref());
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move {
-                client
-                    .collect_order_status_report(&command, algo_lookup)
-                    .await
-            },
-            Ok,
-        ))
-    }
-
-    fn generate_order_status_reports_task(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
-        let client = self.report_client();
-        let core = self.core.clone();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_order_status_reports(&command).await },
-            move |collected| finish_order_status_reports(&core, collected),
-        ))
-    }
-
-    fn generate_fill_reports_task(
-        &self,
-        cmd: &GenerateFillReports,
-    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_fill_reports(command).await },
-            Ok,
-        ))
-    }
-
-    fn generate_position_status_reports_task(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
-        let client = self.report_client();
-        let core = self.core.clone();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_position_status_reports(&command).await },
-            move |collected| finish_position_status_reports(&core, collected),
-        ))
-    }
-
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let Some(instrument_id) = cmd.instrument_id else {
+            log::warn!("generate_order_status_report requires instrument_id: {cmd}");
+            return Ok(None);
+        };
+        let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id) else {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope historical Binance Futures order for instrument {instrument_id}"
+                );
+                return Ok(None);
+            }
+
+            anyhow::bail!(
+                "Binance Futures order request has unresolved instrument {instrument_id}"
+            );
+        };
+
+        let symbol = format_binance_symbol(&instrument_id);
+        let order_id = cmd
+            .venue_order_id
+            .as_ref()
+            .map(|id| {
+                id.inner()
+                    .parse::<i64>()
+                    .context("failed to parse venue_order_id as numeric")
+            })
+            .transpose()?;
+        let orig_client_order_id = cmd
+            .client_order_id
+            .map(|id| encode_broker_id(&id, BINANCE_NAUTILUS_FUTURES_BROKER_ID));
+
+        let mut builder = BinanceOrderQueryParamsBuilder::default();
+        builder.symbol(symbol);
+
+        if let Some(oid) = order_id {
+            builder.order_id(oid);
+        }
+
+        if let Some(ref coid) = orig_client_order_id {
+            builder.orig_client_order_id(coid.clone());
+        }
+        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let price_precision = instrument.price_precision();
+        let size_precision = instrument.size_precision();
+        let ts_init = self.clock.get_time_ns();
         let algo_lookup = self.resolve_algo_lookup(cmd.client_order_id, cmd.params.as_ref());
-        self.report_client()
-            .collect_order_status_report(cmd, algo_lookup)
-            .await
+
+        if algo_lookup == BinanceFuturesAlgoLookup::AlgoId {
+            let algo_order = self
+                .http_client
+                .query_algo_order_with_history(
+                    instrument_id,
+                    cmd.client_order_id,
+                    cmd.venue_order_id,
+                )
+                .await?;
+
+            return match algo_order {
+                Some(result) => Ok(Some(create_algo_order_status_report(
+                    &result,
+                    self.core.account_id,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    self.config.treat_expired_as_canceled,
+                    self.config.use_position_ids,
+                    ts_init,
+                )?)),
+                None => {
+                    log::debug!("Algo order query returned no matching order");
+                    Ok(None)
+                }
+            };
+        }
+
+        match self.http_client.query_order(&params).await {
+            Ok(order) => {
+                let report = order.to_order_status_report(
+                    self.core.account_id,
+                    instrument_id,
+                    price_precision,
+                    size_precision,
+                    self.config.treat_expired_as_canceled,
+                    ts_init,
+                )?;
+                let venue_position_id = make_venue_position_id(
+                    self.config.use_position_ids,
+                    instrument_id,
+                    order.position_side,
+                )?;
+                Ok(Some(with_venue_position_id(report, venue_position_id)))
+            }
+            Err(BinanceFuturesHttpError::BinanceError { code: -2013, .. }) => {
+                if algo_lookup == BinanceFuturesAlgoLookup::Skip {
+                    log::debug!("Skipping Algo Service fallback for known regular order");
+                    return Ok(None);
+                }
+
+                // A conditional order may expose its Algo Service `algoId` before triggering and
+                // its matching-engine `actualOrderId` afterwards. Only an explicit ID-kind hint
+                // makes a venue ID safe for Algo Service lookup; cached conditional orders retain
+                // their existing clientAlgoId fallback.
+                let algo_venue_order_id = if algo_lookup == BinanceFuturesAlgoLookup::AlgoId {
+                    cmd.venue_order_id
+                } else {
+                    None
+                };
+                let algo_order = self
+                    .http_client
+                    .query_algo_order_with_history(
+                        instrument_id,
+                        cmd.client_order_id,
+                        algo_venue_order_id,
+                    )
+                    .await?;
+
+                match algo_order {
+                    Some(result) => Ok(Some(create_algo_order_status_report(
+                        &result,
+                        self.core.account_id,
+                        instrument_id,
+                        price_precision,
+                        size_precision,
+                        self.config.treat_expired_as_canceled,
+                        self.config.use_position_ids,
+                        ts_init,
+                    )?)),
+                    None => {
+                        log::debug!("Algo order query returned no matching order");
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let collected = self
-            .report_client()
-            .collect_order_status_reports(cmd)
-            .await?;
-        finish_order_status_reports(&self.core, collected)
+        let ts_init = self.clock.get_time_ns();
+
+        if cmd.open_only {
+            let mut reports = self
+                .generate_open_order_status_reports(cmd.instrument_id, ts_init)
+                .await?;
+
+            if reports.iter().any(|report| {
+                report.quantity_free_close_position_side.is_some()
+                    && !report.report.quantity.is_positive()
+            }) {
+                let position_cmd = GeneratePositionStatusReportsBuilder::default()
+                    .log_receipt_level(cmd.log_receipt_level)
+                    .ts_init(ts_init)
+                    .instrument_id(cmd.instrument_id)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let position_reports = self.generate_position_status_reports(&position_cmd).await?;
+                restore_close_position_quantities(&mut reports, &position_reports);
+            }
+
+            crate::common::execution::log_report_receipt(
+                reports.len(),
+                "OrderStatusReport",
+                cmd.log_receipt_level,
+            );
+            return Ok(reports.into_iter().map(|report| report.report).collect());
+        }
+
+        let mut reports = Vec::new();
+
+        if let Some(instrument_id) = cmd.instrument_id
+            && self
+                .http_client
+                .instrument_reconciliation(&instrument_id)
+                .is_none()
+        {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope Binance Futures order request for instrument {instrument_id}"
+                );
+                return Ok(reports);
+            }
+
+            log::warn!(
+                "Dropping historical Binance Futures orders for unresolved instrument {instrument_id}"
+            );
+            return Ok(reports);
+        }
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+            else {
+                if self.is_instrument_out_of_scope(instrument_id) {
+                    log::debug!(
+                        "Dropping out-of-scope historical Binance Futures orders for instrument {instrument_id}"
+                    );
+                } else {
+                    log::warn!(
+                        "Dropping historical Binance Futures orders for unresolved instrument {instrument_id}"
+                    );
+                }
+                return Ok(reports);
+            };
+            let symbol = format_binance_symbol(&instrument_id);
+            let start_time = cmd
+                .start
+                .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
+            let end_time = cmd
+                .end
+                .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
+
+            let mut builder = BinanceAllOrdersParamsBuilder::default();
+            builder.symbol(symbol);
+
+            if let Some(st) = start_time {
+                builder.start_time(st);
+            }
+
+            if let Some(et) = end_time {
+                builder.end_time(et);
+            }
+            let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            let orders = self.http_client.query_all_orders(&params).await?;
+
+            for order in orders {
+                let report = order.to_order_status_report(
+                    self.core.account_id,
+                    instrument.id(),
+                    instrument.price_precision(),
+                    instrument.size_precision(),
+                    self.config.treat_expired_as_canceled,
+                    ts_init,
+                )?;
+                let venue_position_id = make_venue_position_id(
+                    self.config.use_position_ids,
+                    instrument.id(),
+                    order.position_side,
+                )?;
+                reports.push(with_venue_position_id(report, venue_position_id));
+            }
+        }
+
+        crate::common::execution::log_report_receipt(
+            reports.len(),
+            "OrderStatusReport",
+            cmd.log_receipt_level,
+        );
+        Ok(reports)
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        self.report_client().collect_fill_reports(cmd).await
+        let Some(instrument_id) = cmd.instrument_id else {
+            log::warn!("generate_fill_reports requires instrument_id for Binance Futures");
+            return Ok(Vec::new());
+        };
+        let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id) else {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope historical Binance Futures fills for instrument {instrument_id}"
+                );
+            } else {
+                log::warn!(
+                    "Dropping historical Binance Futures fills for unresolved instrument {instrument_id}"
+                );
+            }
+            return Ok(Vec::new());
+        };
+
+        let symbol = format_binance_symbol(&instrument_id);
+        let mut trades = Vec::new();
+        let mut seen_trade_ids = AHashSet::new();
+        let order_id = cmd
+            .venue_order_id
+            .map(|id| {
+                id.inner()
+                    .parse::<i64>()
+                    .context("invalid fill report venue order ID")
+            })
+            .transpose()?;
+        let requested_end_time = cmd
+            .end
+            .map(|end| end.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
+
+        if let Some(start) = cmd.start {
+            let query_start_time = start.as_i64() / NANOSECONDS_IN_MILLISECOND as i64;
+            let query_end_time = requested_end_time.unwrap_or_else(|| {
+                self.clock.get_time_ns().as_i64() / NANOSECONDS_IN_MILLISECOND as i64
+            });
+            anyhow::ensure!(
+                query_start_time <= query_end_time,
+                "fill report start time must not exceed end time"
+            );
+            let complete_start = user_trades_complete_start(cmd.ts_init, self.clock.get_time_ns());
+            anyhow::ensure!(
+                start >= complete_start,
+                "Binance Futures fill report range is incomplete: start {start} precedes complete-history boundary {complete_start}"
+            );
+            let mut window_start = query_start_time;
+
+            loop {
+                let window_end = window_start
+                    .saturating_add(USER_TRADES_MAX_INTERVAL_MS)
+                    .min(query_end_time);
+                let mut from_id = None;
+
+                loop {
+                    let mut builder = BinanceUserTradesParamsBuilder::default();
+                    builder.symbol(symbol.clone());
+                    builder.limit(USER_TRADES_PAGE_LIMIT);
+                    if let Some(order_id) = order_id {
+                        builder.order_id(order_id);
+                    }
+
+                    if let Some(cursor) = from_id {
+                        builder.from_id(cursor);
+                    } else {
+                        builder.start_time(window_start);
+                        builder.end_time(window_end);
+                    }
+                    let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let page = self.http_client.query_user_trades(&params).await?;
+
+                    if page.is_empty() {
+                        break;
+                    }
+
+                    let page_len = page.len();
+                    let max_trade_id = page.iter().map(|trade| trade.id).max().unwrap();
+                    let passed_window_end = page.iter().any(|trade| trade.time > window_end);
+
+                    trades.extend(page.into_iter().filter(|trade| {
+                        trade.time >= window_start
+                            && trade.time <= window_end
+                            && seen_trade_ids.insert(trade.id)
+                    }));
+
+                    if page_len < USER_TRADES_PAGE_LIMIT as usize || passed_window_end {
+                        break;
+                    }
+
+                    let next_from_id = max_trade_id
+                        .checked_add(1)
+                        .context("Binance user trade ID overflow during pagination")?;
+                    anyhow::ensure!(
+                        from_id.is_none_or(|cursor| next_from_id > cursor),
+                        "Binance user-trades pagination made no progress"
+                    );
+                    from_id = Some(next_from_id);
+                }
+
+                if window_end >= query_end_time {
+                    break;
+                }
+                window_start = window_end.saturating_add(1);
+            }
+        } else {
+            anyhow::ensure!(
+                cmd.end.is_none(),
+                "Binance Futures fill report end time requires start time for a complete range"
+            );
+            let mut from_id = 0;
+
+            loop {
+                let mut builder = BinanceUserTradesParamsBuilder::default();
+                builder.symbol(symbol.clone());
+                builder.from_id(from_id);
+                builder.limit(USER_TRADES_PAGE_LIMIT);
+                if let Some(order_id) = order_id {
+                    builder.order_id(order_id);
+                }
+                let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let page = self.http_client.query_user_trades(&params).await?;
+
+                if page.is_empty() {
+                    break;
+                }
+
+                let page_len = page.len();
+                let max_trade_id = page.iter().map(|trade| trade.id).max().unwrap();
+                let passed_end = requested_end_time
+                    .is_some_and(|end_time| page.iter().any(|trade| trade.time > end_time));
+
+                trades.extend(page.into_iter().filter(|trade| {
+                    requested_end_time.is_none_or(|end_time| trade.time <= end_time)
+                        && seen_trade_ids.insert(trade.id)
+                }));
+
+                if page_len < USER_TRADES_PAGE_LIMIT as usize || passed_end {
+                    break;
+                }
+
+                let next_from_id = max_trade_id
+                    .checked_add(1)
+                    .context("Binance user trade ID overflow during pagination")?;
+                anyhow::ensure!(
+                    next_from_id > from_id,
+                    "Binance user-trades pagination made no progress"
+                );
+                from_id = next_from_id;
+            }
+        }
+
+        trades.sort_unstable_by_key(|trade| (trade.time, trade.id));
+        let ts_init = self.clock.get_time_ns();
+
+        let mut reports = Vec::new();
+
+        for trade in trades {
+            if order_id.is_some_and(|order_id| trade.order_id != order_id) {
+                continue;
+            }
+            let venue_position_id = make_venue_position_id(
+                self.config.use_position_ids,
+                instrument.id(),
+                trade.position_side,
+            )?;
+            let mut report = trade.to_fill_report(
+                self.core.account_id,
+                instrument.id(),
+                instrument.price_precision(),
+                instrument.size_precision(),
+                self.config.bnfcr_currency,
+                ts_init,
+            )?;
+            report.venue_position_id = venue_position_id;
+            reports.push(report);
+        }
+
+        crate::common::execution::log_report_receipt(
+            reports.len(),
+            "FillReport",
+            cmd.log_receipt_level,
+        );
+        Ok(reports)
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let collected = self
-            .report_client()
-            .collect_position_status_reports(cmd)
-            .await?;
-        finish_position_status_reports(&self.core, collected)
+        if let Some(instrument_id) = cmd.instrument_id
+            && self
+                .http_client
+                .instrument_reconciliation(&instrument_id)
+                .is_none()
+        {
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope Binance Futures position request for instrument {instrument_id}"
+                );
+                return Ok(Vec::new());
+            }
+            anyhow::bail!(
+                "Binance Futures position request has unresolved instrument {instrument_id}"
+            );
+        }
+        let symbol = cmd.instrument_id.map(|id| format_binance_symbol(&id));
+
+        let mut builder = BinancePositionRiskParamsBuilder::default();
+
+        if let Some(s) = symbol {
+            builder.symbol(s);
+        }
+        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let positions = self.http_client.query_positions(&params).await?;
+
+        let mut reports = Vec::new();
+        let mut position_reports_failed = 0usize;
+
+        for position in positions {
+            let instrument_id = format_instrument_id(&position.symbol, self.product_type);
+
+            if self.is_instrument_out_of_scope(instrument_id) {
+                log::debug!(
+                    "Dropping out-of-scope Binance Futures position for instrument {instrument_id}"
+                );
+                continue;
+            }
+
+            let position_amt = match position.position_amt.parse::<Decimal>() {
+                Ok(value) => value,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to parse Futures position_amt for symbol={}: {e}",
+                        position.symbol
+                    );
+                    position_reports_failed += 1;
+                    continue;
+                }
+            };
+
+            if position_amt.is_zero() {
+                if self.config.use_position_ids {
+                    let position_side = match position.position_side {
+                        Some(BinancePositionSide::Long) => PositionSide::Long,
+                        Some(BinancePositionSide::Short) => PositionSide::Short,
+                        _ => continue,
+                    };
+
+                    let venue_position_id =
+                        make_venue_position_id(true, instrument_id, position.position_side)?
+                            .expect("hedge position sides always produce an ID");
+
+                    if let Err(e) = self.ensure_cached_position_id_compatible(
+                        instrument_id,
+                        position_side,
+                        venue_position_id,
+                    ) {
+                        log::warn!(
+                            "Failed to create Futures position report for symbol={}: {e}",
+                            position.symbol
+                        );
+                        position_reports_failed += 1;
+                    }
+                }
+                continue;
+            }
+
+            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
+            else {
+                log::warn!(
+                    "Failed to create Futures position report for symbol={}: instrument {instrument_id} is unresolved",
+                    position.symbol
+                );
+                position_reports_failed += 1;
+                continue;
+            };
+
+            match self.create_position_report(
+                &position,
+                instrument.id(),
+                instrument.size_precision(),
+            ) {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to create Futures position report for symbol={}: {e}",
+                        position.symbol
+                    );
+                    position_reports_failed += 1;
+                }
+            }
+        }
+
+        anyhow::ensure!(
+            position_reports_failed == 0,
+            "Failed to process {position_reports_failed} Binance Futures position reports",
+        );
+
+        crate::common::execution::log_report_receipt(
+            reports.len(),
+            "PositionStatusReport",
+            cmd.log_receipt_level,
+        );
+        Ok(reports)
     }
 
     async fn generate_mass_status(
@@ -2239,9 +2909,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let client = self.report_client();
         let (mut open_order_reports, position_reports) = tokio::try_join!(
-            client.collect_open_order_status_reports(None, ts_now),
+            self.generate_open_order_status_reports(None, ts_now),
             self.generate_position_status_reports(&position_cmd),
         )?;
         restore_close_position_quantities(&mut open_order_reports, &position_reports);
@@ -3227,897 +3896,6 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
         Ok(())
     }
-}
-
-/// Owned Binance Futures report collection context.
-///
-/// Holds no cache or core-thread state, so report collection can run on a runtime worker.
-/// Cached position ID checks are deferred to the core-thread finalization.
-struct BinanceFuturesReportClient {
-    account_id: AccountId,
-    clock: &'static AtomicTime,
-    http_client: BinanceFuturesHttpClient,
-    product_type: BinanceProductType,
-    instrument_provider: BinanceInstrumentProviderConfig,
-    treat_expired_as_canceled: bool,
-    use_position_ids: bool,
-    bnfcr_currency: Currency,
-}
-
-impl BinanceFuturesReportClient {
-    fn is_instrument_out_of_scope(&self, instrument_id: InstrumentId) -> bool {
-        self.instrument_provider.excludes(instrument_id)
-    }
-
-    async fn collect_order_status_report(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-        algo_lookup: BinanceFuturesAlgoLookup,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let Some(instrument_id) = cmd.instrument_id else {
-            log::warn!("generate_order_status_report requires instrument_id: {cmd}");
-            return Ok(None);
-        };
-        let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id) else {
-            if self.is_instrument_out_of_scope(instrument_id) {
-                log::debug!(
-                    "Dropping out-of-scope historical Binance Futures order for instrument {instrument_id}"
-                );
-                return Ok(None);
-            }
-
-            anyhow::bail!(
-                "Binance Futures order request has unresolved instrument {instrument_id}"
-            );
-        };
-
-        let symbol = format_binance_symbol(&instrument_id);
-        let order_id = cmd
-            .venue_order_id
-            .as_ref()
-            .map(|id| {
-                id.inner()
-                    .parse::<i64>()
-                    .context("failed to parse venue_order_id as numeric")
-            })
-            .transpose()?;
-        let orig_client_order_id = cmd
-            .client_order_id
-            .map(|id| encode_broker_id(&id, BINANCE_NAUTILUS_FUTURES_BROKER_ID));
-
-        let mut builder = BinanceOrderQueryParamsBuilder::default();
-        builder.symbol(symbol);
-
-        if let Some(oid) = order_id {
-            builder.order_id(oid);
-        }
-
-        if let Some(ref coid) = orig_client_order_id {
-            builder.orig_client_order_id(coid.clone());
-        }
-        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let price_precision = instrument.price_precision();
-        let size_precision = instrument.size_precision();
-        let ts_init = self.clock.get_time_ns();
-
-        if algo_lookup == BinanceFuturesAlgoLookup::AlgoId {
-            let algo_order = self
-                .http_client
-                .query_algo_order_with_history(
-                    instrument_id,
-                    cmd.client_order_id,
-                    cmd.venue_order_id,
-                )
-                .await?;
-
-            return match algo_order {
-                Some(result) => Ok(Some(create_algo_order_status_report(
-                    &result,
-                    self.account_id,
-                    instrument_id,
-                    price_precision,
-                    size_precision,
-                    self.treat_expired_as_canceled,
-                    self.use_position_ids,
-                    ts_init,
-                )?)),
-                None => {
-                    log::debug!("Algo order query returned no matching order");
-                    Ok(None)
-                }
-            };
-        }
-
-        match self.http_client.query_order(&params).await {
-            Ok(order) => {
-                let report = order.to_order_status_report(
-                    self.account_id,
-                    instrument_id,
-                    price_precision,
-                    size_precision,
-                    self.treat_expired_as_canceled,
-                    ts_init,
-                )?;
-                let venue_position_id = make_venue_position_id(
-                    self.use_position_ids,
-                    instrument_id,
-                    order.position_side,
-                )?;
-                Ok(Some(with_venue_position_id(report, venue_position_id)))
-            }
-            Err(BinanceFuturesHttpError::BinanceError { code: -2013, .. }) => {
-                if algo_lookup == BinanceFuturesAlgoLookup::Skip {
-                    log::debug!("Skipping Algo Service fallback for known regular order");
-                    return Ok(None);
-                }
-
-                // A conditional order may expose its Algo Service `algoId` before triggering and
-                // its matching-engine `actualOrderId` afterwards. Only an explicit ID-kind hint
-                // makes a venue ID safe for Algo Service lookup; cached conditional orders retain
-                // their existing clientAlgoId fallback.
-                let algo_venue_order_id = if algo_lookup == BinanceFuturesAlgoLookup::AlgoId {
-                    cmd.venue_order_id
-                } else {
-                    None
-                };
-                let algo_order = self
-                    .http_client
-                    .query_algo_order_with_history(
-                        instrument_id,
-                        cmd.client_order_id,
-                        algo_venue_order_id,
-                    )
-                    .await?;
-
-                match algo_order {
-                    Some(result) => Ok(Some(create_algo_order_status_report(
-                        &result,
-                        self.account_id,
-                        instrument_id,
-                        price_precision,
-                        size_precision,
-                        self.treat_expired_as_canceled,
-                        self.use_position_ids,
-                        ts_init,
-                    )?)),
-                    None => {
-                        log::debug!("Algo order query returned no matching order");
-                        Ok(None)
-                    }
-                }
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn collect_open_order_status_reports(
-        &self,
-        instrument_id: Option<InstrumentId>,
-        ts_init: UnixNanos,
-    ) -> anyhow::Result<Vec<OpenOrderStatusReport>> {
-        if let Some(instrument_id) = instrument_id
-            && self
-                .http_client
-                .instrument_reconciliation(&instrument_id)
-                .is_none()
-        {
-            if self.is_instrument_out_of_scope(instrument_id) {
-                log::debug!(
-                    "Dropping out-of-scope Binance Futures order request for instrument {instrument_id}"
-                );
-                return Ok(Vec::new());
-            }
-
-            anyhow::bail!(
-                "Binance Futures open order request has unresolved instrument {instrument_id}"
-            );
-        }
-
-        let symbol = instrument_id.map(|id| format_binance_symbol(&id));
-        let mut builder = BinanceOpenOrdersParamsBuilder::default();
-
-        if let Some(symbol) = symbol {
-            builder.symbol(symbol);
-        }
-        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let (orders, algo_orders) = tokio::try_join!(
-            self.http_client.query_open_orders(&params),
-            self.http_client.query_open_algo_orders(instrument_id),
-        )?;
-        let mut reports = Vec::with_capacity(orders.len() + algo_orders.len());
-
-        for order in orders {
-            let instrument_id = instrument_id
-                .unwrap_or_else(|| format_instrument_id(&order.symbol, self.product_type));
-            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
-            else {
-                if self.is_instrument_out_of_scope(instrument_id) {
-                    log::debug!(
-                        "Dropping out-of-scope Binance Futures open order for instrument {instrument_id}"
-                    );
-                    continue;
-                }
-                anyhow::bail!(
-                    "Binance Futures open order has unresolved instrument {instrument_id}"
-                );
-            };
-
-            let report = order.to_order_status_report(
-                self.account_id,
-                instrument.id(),
-                instrument.price_precision(),
-                instrument.size_precision(),
-                self.treat_expired_as_canceled,
-                ts_init,
-            )?;
-            let venue_position_id = make_venue_position_id(
-                self.use_position_ids,
-                instrument.id(),
-                order.position_side,
-            )?;
-            reports.push(OpenOrderStatusReport {
-                report: with_venue_position_id(report, venue_position_id),
-                quantity_free_close_position_side: None,
-            });
-        }
-
-        for algo_order in algo_orders {
-            let instrument_id = instrument_id
-                .unwrap_or_else(|| format_instrument_id(&algo_order.symbol, self.product_type));
-            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
-            else {
-                if self.is_instrument_out_of_scope(instrument_id) {
-                    log::debug!(
-                        "Dropping out-of-scope Binance Futures open algo order for instrument {instrument_id}"
-                    );
-                    continue;
-                }
-                anyhow::bail!(
-                    "Binance Futures open algo order has unresolved instrument {instrument_id}"
-                );
-            };
-
-            let report = algo_order.to_order_status_report(
-                self.account_id,
-                instrument.id(),
-                instrument.price_precision(),
-                instrument.size_precision(),
-                ts_init,
-            )?;
-            let venue_position_id = make_venue_position_id(
-                self.use_position_ids,
-                instrument.id(),
-                algo_order.position_side,
-            )?;
-            reports.push(OpenOrderStatusReport {
-                report: with_venue_position_id(report, venue_position_id),
-                quantity_free_close_position_side: quantity_free_close_position_side(&algo_order),
-            });
-        }
-
-        Ok(reports)
-    }
-
-    async fn collect_order_status_reports(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<CollectedOrderStatusReports> {
-        let ts_init = self.clock.get_time_ns();
-
-        if cmd.open_only {
-            let reports = self
-                .collect_open_order_status_reports(cmd.instrument_id, ts_init)
-                .await?;
-
-            let positions = if reports.iter().any(|report| {
-                report.quantity_free_close_position_side.is_some()
-                    && !report.report.quantity.is_positive()
-            }) {
-                let position_cmd = GeneratePositionStatusReportsBuilder::default()
-                    .log_receipt_level(cmd.log_receipt_level)
-                    .ts_init(ts_init)
-                    .instrument_id(cmd.instrument_id)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Some(self.collect_position_status_reports(&position_cmd).await?)
-            } else {
-                None
-            };
-
-            return Ok(CollectedOrderStatusReports::Open {
-                reports,
-                positions,
-                log_receipt_level: cmd.log_receipt_level,
-            });
-        }
-
-        let mut reports = Vec::new();
-
-        if let Some(instrument_id) = cmd.instrument_id
-            && self
-                .http_client
-                .instrument_reconciliation(&instrument_id)
-                .is_none()
-        {
-            if self.is_instrument_out_of_scope(instrument_id) {
-                log::debug!(
-                    "Dropping out-of-scope Binance Futures order request for instrument {instrument_id}"
-                );
-                return Ok(CollectedOrderStatusReports::Historical(reports));
-            }
-
-            log::warn!(
-                "Dropping historical Binance Futures orders for unresolved instrument {instrument_id}"
-            );
-            return Ok(CollectedOrderStatusReports::Historical(reports));
-        }
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
-            else {
-                if self.is_instrument_out_of_scope(instrument_id) {
-                    log::debug!(
-                        "Dropping out-of-scope historical Binance Futures orders for instrument {instrument_id}"
-                    );
-                } else {
-                    log::warn!(
-                        "Dropping historical Binance Futures orders for unresolved instrument {instrument_id}"
-                    );
-                }
-                return Ok(CollectedOrderStatusReports::Historical(reports));
-            };
-            let symbol = format_binance_symbol(&instrument_id);
-            let start_time = cmd
-                .start
-                .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
-            let end_time = cmd
-                .end
-                .map(|t| t.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
-
-            let mut builder = BinanceAllOrdersParamsBuilder::default();
-            builder.symbol(symbol);
-
-            if let Some(st) = start_time {
-                builder.start_time(st);
-            }
-
-            if let Some(et) = end_time {
-                builder.end_time(et);
-            }
-            let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let orders = self.http_client.query_all_orders(&params).await?;
-
-            for order in orders {
-                let report = order.to_order_status_report(
-                    self.account_id,
-                    instrument.id(),
-                    instrument.price_precision(),
-                    instrument.size_precision(),
-                    self.treat_expired_as_canceled,
-                    ts_init,
-                )?;
-                let venue_position_id = make_venue_position_id(
-                    self.use_position_ids,
-                    instrument.id(),
-                    order.position_side,
-                )?;
-                reports.push(with_venue_position_id(report, venue_position_id));
-            }
-        }
-
-        crate::common::execution::log_report_receipt(
-            reports.len(),
-            "OrderStatusReport",
-            cmd.log_receipt_level,
-        );
-        Ok(CollectedOrderStatusReports::Historical(reports))
-    }
-
-    async fn collect_fill_reports(
-        &self,
-        cmd: GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        let Some(instrument_id) = cmd.instrument_id else {
-            log::warn!("generate_fill_reports requires instrument_id for Binance Futures");
-            return Ok(Vec::new());
-        };
-        let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id) else {
-            if self.is_instrument_out_of_scope(instrument_id) {
-                log::debug!(
-                    "Dropping out-of-scope historical Binance Futures fills for instrument {instrument_id}"
-                );
-            } else {
-                log::warn!(
-                    "Dropping historical Binance Futures fills for unresolved instrument {instrument_id}"
-                );
-            }
-            return Ok(Vec::new());
-        };
-
-        let symbol = format_binance_symbol(&instrument_id);
-        let mut trades = Vec::new();
-        let mut seen_trade_ids = AHashSet::new();
-        let order_id = cmd
-            .venue_order_id
-            .map(|id| {
-                id.inner()
-                    .parse::<i64>()
-                    .context("invalid fill report venue order ID")
-            })
-            .transpose()?;
-        let requested_end_time = cmd
-            .end
-            .map(|end| end.as_i64() / NANOSECONDS_IN_MILLISECOND as i64);
-
-        if let Some(start) = cmd.start {
-            let query_start_time = start.as_i64() / NANOSECONDS_IN_MILLISECOND as i64;
-            let query_end_time = requested_end_time.unwrap_or_else(|| {
-                self.clock.get_time_ns().as_i64() / NANOSECONDS_IN_MILLISECOND as i64
-            });
-            anyhow::ensure!(
-                query_start_time <= query_end_time,
-                "fill report start time must not exceed end time"
-            );
-            let complete_start = user_trades_complete_start(cmd.ts_init, self.clock.get_time_ns());
-            anyhow::ensure!(
-                start >= complete_start,
-                "Binance Futures fill report range is incomplete: start {start} precedes complete-history boundary {complete_start}"
-            );
-            let mut window_start = query_start_time;
-
-            loop {
-                let window_end = window_start
-                    .saturating_add(USER_TRADES_MAX_INTERVAL_MS)
-                    .min(query_end_time);
-                let mut from_id = None;
-
-                loop {
-                    let mut builder = BinanceUserTradesParamsBuilder::default();
-                    builder.symbol(symbol.clone());
-                    builder.limit(USER_TRADES_PAGE_LIMIT);
-                    if let Some(order_id) = order_id {
-                        builder.order_id(order_id);
-                    }
-
-                    if let Some(cursor) = from_id {
-                        builder.from_id(cursor);
-                    } else {
-                        builder.start_time(window_start);
-                        builder.end_time(window_end);
-                    }
-                    let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let page = self.http_client.query_user_trades(&params).await?;
-
-                    if page.is_empty() {
-                        break;
-                    }
-
-                    let page_len = page.len();
-                    let max_trade_id = page.iter().map(|trade| trade.id).max().unwrap();
-                    let passed_window_end = page.iter().any(|trade| trade.time > window_end);
-
-                    trades.extend(page.into_iter().filter(|trade| {
-                        trade.time >= window_start
-                            && trade.time <= window_end
-                            && seen_trade_ids.insert(trade.id)
-                    }));
-
-                    if page_len < USER_TRADES_PAGE_LIMIT as usize || passed_window_end {
-                        break;
-                    }
-
-                    let next_from_id = max_trade_id
-                        .checked_add(1)
-                        .context("Binance user trade ID overflow during pagination")?;
-                    anyhow::ensure!(
-                        from_id.is_none_or(|cursor| next_from_id > cursor),
-                        "Binance user-trades pagination made no progress"
-                    );
-                    from_id = Some(next_from_id);
-                }
-
-                if window_end >= query_end_time {
-                    break;
-                }
-                window_start = window_end.saturating_add(1);
-            }
-        } else {
-            anyhow::ensure!(
-                cmd.end.is_none(),
-                "Binance Futures fill report end time requires start time for a complete range"
-            );
-            let mut from_id = 0;
-
-            loop {
-                let mut builder = BinanceUserTradesParamsBuilder::default();
-                builder.symbol(symbol.clone());
-                builder.from_id(from_id);
-                builder.limit(USER_TRADES_PAGE_LIMIT);
-                if let Some(order_id) = order_id {
-                    builder.order_id(order_id);
-                }
-                let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-                let page = self.http_client.query_user_trades(&params).await?;
-
-                if page.is_empty() {
-                    break;
-                }
-
-                let page_len = page.len();
-                let max_trade_id = page.iter().map(|trade| trade.id).max().unwrap();
-                let passed_end = requested_end_time
-                    .is_some_and(|end_time| page.iter().any(|trade| trade.time > end_time));
-
-                trades.extend(page.into_iter().filter(|trade| {
-                    requested_end_time.is_none_or(|end_time| trade.time <= end_time)
-                        && seen_trade_ids.insert(trade.id)
-                }));
-
-                if page_len < USER_TRADES_PAGE_LIMIT as usize || passed_end {
-                    break;
-                }
-
-                let next_from_id = max_trade_id
-                    .checked_add(1)
-                    .context("Binance user trade ID overflow during pagination")?;
-                anyhow::ensure!(
-                    next_from_id > from_id,
-                    "Binance user-trades pagination made no progress"
-                );
-                from_id = next_from_id;
-            }
-        }
-
-        trades.sort_unstable_by_key(|trade| (trade.time, trade.id));
-        let ts_init = self.clock.get_time_ns();
-
-        let mut reports = Vec::new();
-
-        for trade in trades {
-            if order_id.is_some_and(|order_id| trade.order_id != order_id) {
-                continue;
-            }
-            let venue_position_id = make_venue_position_id(
-                self.use_position_ids,
-                instrument.id(),
-                trade.position_side,
-            )?;
-            let mut report = trade.to_fill_report(
-                self.account_id,
-                instrument.id(),
-                instrument.price_precision(),
-                instrument.size_precision(),
-                self.bnfcr_currency,
-                ts_init,
-            )?;
-            report.venue_position_id = venue_position_id;
-            reports.push(report);
-        }
-
-        crate::common::execution::log_report_receipt(
-            reports.len(),
-            "FillReport",
-            cmd.log_receipt_level,
-        );
-        Ok(reports)
-    }
-
-    async fn collect_position_status_reports(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<CollectedPositionStatusReports> {
-        let mut collected = CollectedPositionStatusReports {
-            positions: Vec::new(),
-            failed: 0,
-            log_receipt_level: cmd.log_receipt_level,
-        };
-
-        if let Some(instrument_id) = cmd.instrument_id
-            && self
-                .http_client
-                .instrument_reconciliation(&instrument_id)
-                .is_none()
-        {
-            if self.is_instrument_out_of_scope(instrument_id) {
-                log::debug!(
-                    "Dropping out-of-scope Binance Futures position request for instrument {instrument_id}"
-                );
-                return Ok(collected);
-            }
-            anyhow::bail!(
-                "Binance Futures position request has unresolved instrument {instrument_id}"
-            );
-        }
-        let symbol = cmd.instrument_id.map(|id| format_binance_symbol(&id));
-
-        let mut builder = BinancePositionRiskParamsBuilder::default();
-
-        if let Some(s) = symbol {
-            builder.symbol(s);
-        }
-        let params = builder.build().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let positions = self.http_client.query_positions(&params).await?;
-
-        for position in positions {
-            let instrument_id = format_instrument_id(&position.symbol, self.product_type);
-
-            if self.is_instrument_out_of_scope(instrument_id) {
-                log::debug!(
-                    "Dropping out-of-scope Binance Futures position for instrument {instrument_id}"
-                );
-                continue;
-            }
-
-            let position_amt = match position.position_amt.parse::<Decimal>() {
-                Ok(value) => value,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to parse Futures position_amt for symbol={}: {e}",
-                        position.symbol
-                    );
-                    collected.failed += 1;
-                    continue;
-                }
-            };
-
-            if position_amt.is_zero() {
-                if self.use_position_ids {
-                    let position_side = match position.position_side {
-                        Some(BinancePositionSide::Long) => PositionSide::Long,
-                        Some(BinancePositionSide::Short) => PositionSide::Short,
-                        _ => continue,
-                    };
-
-                    let venue_position_id =
-                        make_venue_position_id(true, instrument_id, position.position_side)?
-                            .expect("hedge position sides always produce an ID");
-
-                    collected.positions.push(CollectedPositionStatusReport {
-                        symbol: position.symbol,
-                        report: None,
-                        cached_position_check: Some(CachedPositionIdCheck {
-                            instrument_id,
-                            position_side,
-                            venue_position_id,
-                        }),
-                    });
-                }
-                continue;
-            }
-
-            let Some(instrument) = self.http_client.instrument_reconciliation(&instrument_id)
-            else {
-                log::warn!(
-                    "Failed to create Futures position report for symbol={}: instrument {instrument_id} is unresolved",
-                    position.symbol
-                );
-                collected.failed += 1;
-                continue;
-            };
-
-            match self.create_position_report(
-                &position,
-                instrument.id(),
-                instrument.size_precision(),
-            ) {
-                Ok((report, cached_position_check)) => {
-                    collected.positions.push(CollectedPositionStatusReport {
-                        symbol: position.symbol,
-                        report: Some(report),
-                        cached_position_check,
-                    });
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Failed to create Futures position report for symbol={}: {e}",
-                        position.symbol
-                    );
-                    collected.failed += 1;
-                }
-            }
-        }
-
-        Ok(collected)
-    }
-
-    /// Creates a position status report from Binance position risk data.
-    ///
-    /// Returns the cached position ID compatibility check that the core thread must pass before
-    /// the report is accepted.
-    fn create_position_report(
-        &self,
-        position: &BinancePositionRisk,
-        instrument_id: InstrumentId,
-        size_precision: u8,
-    ) -> anyhow::Result<(PositionStatusReport, Option<CachedPositionIdCheck>)> {
-        let position_amount: Decimal = position
-            .position_amt
-            .parse()
-            .context("invalid position_amt")?;
-
-        if position_amount.is_zero() {
-            anyhow::bail!("Position is flat");
-        }
-
-        let entry_price: Decimal = position
-            .entry_price
-            .parse()
-            .context("invalid entry_price")?;
-
-        let position_side = if position_amount > Decimal::ZERO {
-            PositionSide::Long
-        } else {
-            PositionSide::Short
-        };
-
-        if self.use_position_ids {
-            match position.position_side {
-                Some(BinancePositionSide::Long) => anyhow::ensure!(
-                    position_side == PositionSide::Long,
-                    "position_side LONG conflicts with negative position_amt"
-                ),
-                Some(BinancePositionSide::Short) => anyhow::ensure!(
-                    position_side == PositionSide::Short,
-                    "position_side SHORT conflicts with positive position_amt"
-                ),
-                _ => {}
-            }
-        }
-
-        let venue_position_id =
-            make_venue_position_id(self.use_position_ids, instrument_id, position.position_side)?;
-        let cached_position_check = venue_position_id.map(|id| CachedPositionIdCheck {
-            instrument_id,
-            position_side,
-            venue_position_id: id,
-        });
-
-        let ts_now = self.clock.get_time_ns();
-
-        let report = PositionStatusReport::new(
-            self.account_id,
-            instrument_id,
-            position_side,
-            Quantity::from_decimal_dp(position_amount.abs(), size_precision)?,
-            ts_now,
-            ts_now,
-            Some(UUID4::new()),
-            venue_position_id,
-            Some(entry_price),
-        );
-        Ok((report, cached_position_check))
-    }
-}
-
-/// Report collection result whose cache-dependent finalization runs on the core thread.
-enum CollectedOrderStatusReports {
-    Open {
-        reports: Vec<OpenOrderStatusReport>,
-        positions: Option<CollectedPositionStatusReports>,
-        log_receipt_level: LogLevel,
-    },
-    Historical(Vec<OrderStatusReport>),
-}
-
-/// Venue position reports awaiting cached position ID checks on the core thread.
-struct CollectedPositionStatusReports {
-    positions: Vec<CollectedPositionStatusReport>,
-    failed: usize,
-    log_receipt_level: LogLevel,
-}
-
-struct CollectedPositionStatusReport {
-    symbol: ustr::Ustr,
-    report: Option<PositionStatusReport>,
-    cached_position_check: Option<CachedPositionIdCheck>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CachedPositionIdCheck {
-    instrument_id: InstrumentId,
-    position_side: PositionSide,
-    venue_position_id: PositionId,
-}
-
-fn finish_order_status_reports(
-    core: &ExecutionClientCore,
-    collected: CollectedOrderStatusReports,
-) -> anyhow::Result<Vec<OrderStatusReport>> {
-    match collected {
-        CollectedOrderStatusReports::Open {
-            mut reports,
-            positions,
-            log_receipt_level,
-        } => {
-            if let Some(positions) = positions {
-                let position_reports = finish_position_status_reports(core, positions)?;
-                restore_close_position_quantities(&mut reports, &position_reports);
-            }
-
-            crate::common::execution::log_report_receipt(
-                reports.len(),
-                "OrderStatusReport",
-                log_receipt_level,
-            );
-            Ok(reports.into_iter().map(|report| report.report).collect())
-        }
-        CollectedOrderStatusReports::Historical(reports) => Ok(reports),
-    }
-}
-
-fn finish_position_status_reports(
-    core: &ExecutionClientCore,
-    collected: CollectedPositionStatusReports,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
-    let mut reports = Vec::with_capacity(collected.positions.len());
-    let mut position_reports_failed = collected.failed;
-
-    for position in collected.positions {
-        if let Some(check) = position.cached_position_check
-            && let Err(e) = ensure_cached_position_id_compatible(
-                core,
-                check.instrument_id,
-                check.position_side,
-                check.venue_position_id,
-            )
-        {
-            log::warn!(
-                "Failed to create Futures position report for symbol={}: {e}",
-                position.symbol
-            );
-            position_reports_failed += 1;
-            continue;
-        }
-
-        if let Some(report) = position.report {
-            reports.push(report);
-        }
-    }
-
-    anyhow::ensure!(
-        position_reports_failed == 0,
-        "Failed to process {position_reports_failed} Binance Futures position reports",
-    );
-
-    crate::common::execution::log_report_receipt(
-        reports.len(),
-        "PositionStatusReport",
-        collected.log_receipt_level,
-    );
-    Ok(reports)
-}
-
-fn ensure_cached_position_id_compatible(
-    core: &ExecutionClientCore,
-    instrument_id: InstrumentId,
-    position_side: PositionSide,
-    venue_position_id: PositionId,
-) -> anyhow::Result<()> {
-    let cache = core.cache();
-    let mut incompatible_ids: Vec<_> = cache
-        .positions_open(
-            Some(&BINANCE_VENUE),
-            Some(&instrument_id),
-            None,
-            Some(&core.account_id),
-            Some(position_side),
-        )
-        .into_iter()
-        .filter(|position| position.id != venue_position_id)
-        .map(|position| position.id.to_string())
-        .collect();
-    incompatible_ids.sort_unstable();
-
-    anyhow::ensure!(
-        incompatible_ids.is_empty(),
-        "incompatible cached {position_side:?} position IDs for {instrument_id}: {}; expected {venue_position_id}",
-        incompatible_ids.join(", "),
-    );
-    Ok(())
 }
 
 fn validate_order(

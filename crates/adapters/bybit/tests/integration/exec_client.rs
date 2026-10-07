@@ -21,9 +21,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    future::Future,
     net::SocketAddr,
-    pin::Pin,
     rc::Rc,
     sync::{
         Arc,
@@ -39,7 +37,7 @@ use axum::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, Uri},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
@@ -56,14 +54,13 @@ use nautilus_bybit::{
 };
 use nautilus_common::{
     cache::Cache,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::{replace_system_event_sender, set_exec_event_sender},
     messages::{
         ExecutionEvent, SystemEvent,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport, GenerateFillReports,
-            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-            ModifyOrder, SubmitOrder,
+            BatchCancelOrders, CancelAllOrders, CancelOrder, ExecutionReport,
+            GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, SubmitOrder,
         },
         system::SocketState,
     },
@@ -85,7 +82,6 @@ use nautilus_model::{
         LimitIfTouchedOrder, MarketIfTouchedOrder, MarketOrder, Order, OrderAny, StopLimitOrder,
         StopMarketOrder, TrailingStopMarketOrder,
     },
-    reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -118,10 +114,6 @@ struct TestServerState {
     switch_mode_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
     set_leverage_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
     set_margin_mode_requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
-    serve_report_history: Arc<AtomicBool>,
-    fail_reports: Arc<AtomicBool>,
-    report_requests: Arc<tokio::sync::Mutex<Vec<String>>>,
-    private_pushes: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 impl Default for TestServerState {
@@ -150,10 +142,6 @@ impl Default for TestServerState {
             switch_mode_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             set_leverage_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             set_margin_mode_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            serve_report_history: Arc::new(AtomicBool::new(false)),
-            fail_reports: Arc::new(AtomicBool::new(false)),
-            report_requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            private_pushes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -237,7 +225,6 @@ async fn handle_get_wallet_balance(
 
 async fn handle_get_positions(
     State(state): State<TestServerState>,
-    uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !has_auth_headers(&headers) {
@@ -253,10 +240,6 @@ async fn handle_get_positions(
             .into_response();
     }
     state.position_requests.fetch_add(1, Ordering::Relaxed);
-
-    if let Some(response) = report_failure(&state, "/v5/position/list", &uri).await {
-        return response;
-    }
     let positions = load_test_data("http_get_positions.json");
     Json(positions).into_response()
 }
@@ -288,75 +271,8 @@ async fn handle_get_empty_report_list(headers: HeaderMap) -> impl IntoResponse {
     .into_response()
 }
 
-async fn report_failure(state: &TestServerState, path: &str, uri: &Uri) -> Option<Response> {
-    let query = uri.query().unwrap_or_default();
-    state
-        .report_requests
-        .lock()
-        .await
-        .push(format!("{path}?{query}"));
-
-    if !state.fail_reports.load(Ordering::Relaxed) {
-        return None;
-    }
-
-    Some(
-        Json(json!({
-            "retCode": 10001,
-            "retMsg": "report request rejected",
-            "result": {},
-            "retExtInfo": {},
-            "time": 1704470400123i64
-        }))
-        .into_response(),
-    )
-}
-
-async fn handle_get_report_history(
-    State(state): State<TestServerState>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Response {
-    if !has_auth_headers(&headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "retCode": 10003,
-                "retMsg": "Invalid API key",
-                "result": {},
-                "time": 1704470400123i64
-            })),
-        )
-            .into_response();
-    }
-
-    let path = uri.path().to_string();
-    if let Some(response) = report_failure(&state, &path, &uri).await {
-        return response;
-    }
-
-    let serve_history = state.serve_report_history.load(Ordering::Relaxed);
-    // Serve the linear fixtures once per query, not per settle coin or product type
-    let query = uri.query().unwrap_or_default();
-    let fixture_query = query.contains("category=linear") && !query.contains("settleCoin=USDC");
-
-    if !serve_history || !fixture_query {
-        return handle_get_empty_report_list(headers).await.into_response();
-    }
-
-    let filename = if path == "/v5/execution/list" {
-        "http_get_executions.json"
-    } else {
-        "http_get_orders_history.json"
-    };
-    let mut data = load_test_data(filename);
-    data["result"]["nextPageCursor"] = json!("");
-    Json(data).into_response()
-}
-
 async fn handle_get_orders_realtime(
     State(state): State<TestServerState>,
-    uri: Uri,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !has_auth_headers(&headers) {
@@ -370,10 +286,6 @@ async fn handle_get_orders_realtime(
             })),
         )
             .into_response();
-    }
-
-    if let Some(response) = report_failure(&state, "/v5/order/realtime", &uri).await {
-        return response;
     }
 
     if state.empty_orders_realtime.load(Ordering::Relaxed) {
@@ -654,31 +566,9 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
         *count += 1;
     }
 
-    let mut subscribed = false;
-
     loop {
         if state.disconnect_trigger.load(Ordering::Relaxed) {
             break;
-        }
-
-        if subscribed {
-            let pushes = std::mem::take(&mut *state.private_pushes.lock().await);
-            let mut send_failed = false;
-
-            for push in pushes {
-                send_failed = socket
-                    .send(Message::Text(push.to_string().into()))
-                    .await
-                    .is_err();
-
-                if send_failed {
-                    break;
-                }
-            }
-
-            if send_failed {
-                break;
-            }
         }
 
         let msg_opt = match tokio::time::timeout(Duration::from_millis(50), socket.recv()).await {
@@ -763,7 +653,6 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                         }
                     }
                     Some("subscribe") => {
-                        subscribed = true;
                         let args = value.get("args").and_then(|a| a.as_array());
                         if let Some(topics) = args {
                             for topic in topics {
@@ -852,8 +741,8 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/v5/account/wallet-balance", get(handle_get_wallet_balance))
         .route("/v5/position/list", get(handle_get_positions))
         .route("/v5/order/realtime", get(handle_get_orders_realtime))
-        .route("/v5/order/history", get(handle_get_report_history))
-        .route("/v5/execution/list", get(handle_get_report_history))
+        .route("/v5/order/history", get(handle_get_empty_report_list))
+        .route("/v5/execution/list", get(handle_get_empty_report_list))
         .route("/v5/order/create", post(handle_post_order))
         .route("/v5/order/cancel", post(handle_cancel_order))
         .route("/v5/order/cancel-all", post(handle_cancel_all_orders))
@@ -975,7 +864,6 @@ fn create_test_execution_client_with_config(
 async fn test_exec_client_scoped_spot_position_reports_follow_config(
     #[case] use_spot_position_reports: bool,
     #[case] expected_reports: usize,
-    #[values(false, true)] worker: bool,
 ) {
     let (addr, _state) = start_test_server().await.unwrap();
     let mut config = create_test_exec_config(addr);
@@ -985,16 +873,18 @@ async fn test_exec_client_scoped_spot_position_reports_follow_config(
     add_test_account_to_cache(&cache, AccountId::from("BYBIT-001"));
     client.connect().await.unwrap();
 
-    let cmd = GeneratePositionStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(InstrumentId::from("ETHUSDT-SPOT.BYBIT")),
-        None,
-        None,
-        None,
-        None,
-    );
-    let reports = generate_positions(&client, &cmd, worker).await.unwrap();
+    let reports = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETHUSDT-SPOT.BYBIT")),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
 
     assert_eq!(reports.len(), expected_reports);
     if use_spot_position_reports {
@@ -1006,9 +896,7 @@ async fn test_exec_client_scoped_spot_position_reports_follow_config(
 
 #[rstest]
 #[tokio::test]
-async fn test_exec_client_mixed_unscoped_position_reports_omit_spot(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_exec_client_mixed_unscoped_position_reports_omit_spot() {
     let (addr, state) = start_test_server().await.unwrap();
     let mut config = create_test_exec_config(addr);
     config.product_types = vec![BybitProductType::Linear, BybitProductType::Spot];
@@ -1021,16 +909,16 @@ async fn test_exec_client_mixed_unscoped_position_reports_omit_spot(
     let positions_before = state.position_requests.load(Ordering::Relaxed);
     let wallet_before = state.wallet_balance_requests.load(Ordering::Relaxed);
 
-    let cmd = GeneratePositionStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let reports = generate_positions(&client, &cmd, worker)
+    let reports = client
+        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
         .await
         .expect("derivative reports must succeed when SPOT coverage is unavailable");
 
@@ -1348,507 +1236,9 @@ async fn test_exec_client_connect_disconnect() {
     );
 }
 
-async fn run_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
-    let ExecutionReportTask { collection, result } = task;
-    run_report_collection(collection).await;
-    result.await
-}
-
-async fn run_report_collection(collection: Pin<Box<dyn Future<Output = ()> + Send>>) {
-    let core_thread = std::thread::current().id();
-    nautilus_common::live::get_runtime()
-        .spawn(async move {
-            assert_ne!(std::thread::current().id(), core_thread);
-            collection.await;
-        })
-        .await
-        .unwrap();
-}
-
-async fn generate_order_report(
-    client: &BybitExecutionClient,
-    cmd: &GenerateOrderStatusReport,
-    worker: bool,
-) -> anyhow::Result<Option<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_report(cmd).await
-    }
-}
-
-async fn generate_order_reports(
-    client: &BybitExecutionClient,
-    cmd: &GenerateOrderStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<OrderStatusReport>> {
-    if worker {
-        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_order_status_reports(cmd).await
-    }
-}
-
-async fn generate_fills(
-    client: &BybitExecutionClient,
-    cmd: GenerateFillReports,
-    worker: bool,
-) -> anyhow::Result<Vec<FillReport>> {
-    if worker {
-        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
-    } else {
-        client.generate_fill_reports(cmd).await
-    }
-}
-
-async fn generate_positions(
-    client: &BybitExecutionClient,
-    cmd: &GeneratePositionStatusReports,
-    worker: bool,
-) -> anyhow::Result<Vec<PositionStatusReport>> {
-    if worker {
-        run_report_task(client.generate_position_status_reports_task(cmd).unwrap()).await
-    } else {
-        client.generate_position_status_reports(cmd).await
-    }
-}
-
-// Report IDs and init timestamps are generated per call, so parity compares everything else
-fn normalized_report_id() -> UUID4 {
-    UUID4::from("2d89666b-1a1e-4a75-b193-4eb3b454c757")
-}
-
-fn normalize_order_reports(reports: Vec<OrderStatusReport>) -> Vec<OrderStatusReport> {
-    reports
-        .into_iter()
-        .map(|mut report| {
-            report.report_id = normalized_report_id();
-            report.ts_init = UnixNanos::default();
-            report
-        })
-        .collect()
-}
-
-fn normalize_fill_reports(reports: Vec<FillReport>) -> Vec<FillReport> {
-    reports
-        .into_iter()
-        .map(|mut report| {
-            report.report_id = normalized_report_id();
-            report.ts_init = UnixNanos::default();
-            report
-        })
-        .collect()
-}
-
-fn normalize_position_reports(reports: Vec<PositionStatusReport>) -> Vec<PositionStatusReport> {
-    reports
-        .into_iter()
-        .map(|mut report| {
-            report.report_id = normalized_report_id();
-            report.ts_init = UnixNanos::default();
-            report
-        })
-        .collect()
-}
-
-async fn connected_report_client() -> (
-    BybitExecutionClient,
-    TestServerState,
-    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    Rc<RefCell<Cache>>,
-) {
-    let (addr, state) = start_test_server().await.unwrap();
-    let mut config = create_test_exec_config(addr);
-    config.product_types = vec![BybitProductType::Linear, BybitProductType::Spot];
-    let (mut client, rx, cache) = create_test_execution_client_with_config(config);
-    add_test_account_to_cache(&cache, AccountId::from("BYBIT-001"));
-    client.connect().await.unwrap();
-    state.serve_report_history.store(true, Ordering::Relaxed);
-    state.report_requests.lock().await.clear();
-    (client, state, rx, cache)
-}
-
-fn report_order(client_order_id: ClientOrderId, instrument_id: InstrumentId) -> OrderAny {
-    OrderAny::Market(MarketOrder::new(
-        TraderId::from("TESTER-001"),
-        StrategyId::from("S-REPORT"),
-        instrument_id,
-        client_order_id,
-        OrderSide::Buy,
-        Quantity::from("0.010"),
-        TimeInForce::Gtc,
-        UUID4::new(),
-        UnixNanos::default(),
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ))
-}
-
-fn ws_order_update(order_id: &str, order_link_id: &str, symbol: &str) -> Value {
-    let mut message = load_test_data("ws_account_order.json");
-    let order = &mut message["data"][0];
-    order["orderId"] = json!(order_id);
-    order["orderLinkId"] = json!(order_link_id);
-    order["symbol"] = json!(symbol);
-    order["orderStatus"] = json!("New");
-    order["cancelType"] = json!("UNKNOWN");
-    order["stopOrderType"] = json!("");
-    message
-}
-
-#[rstest]
-#[case::client_order_id(Some("client-open-1"), None, Some("open-order-1"))]
-#[case::venue_order_id(None, Some("open-order-2"), Some("open-order-2"))]
-#[case::both_mismatched(Some("client-open-1"), Some("open-order-2"), None)]
-#[case::history_only(Some("client-1"), None, Some("abcdef123456"))]
-#[case::unknown(Some("client-unknown"), None, None)]
-#[tokio::test]
-async fn test_generate_order_status_report_task_matches_inline(
-    #[case] client_order_id: Option<&str>,
-    #[case] venue_order_id: Option<&str>,
-    #[case] expected: Option<&str>,
-    #[values(None, Some("ETHUSDT-LINEAR.BYBIT"))] instrument_id: Option<&str>,
-) {
-    let (mut client, state, _rx, _cache) = connected_report_client().await;
-    let cmd = GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        instrument_id.map(InstrumentId::from),
-        client_order_id.map(ClientOrderId::from),
-        venue_order_id.map(VenueOrderId::from),
-        None,
-        None,
-    );
-
-    let inline = generate_order_report(&client, &cmd, false).await.unwrap();
-    let inline_requests = std::mem::take(&mut *state.report_requests.lock().await);
-    let worker = generate_order_report(&client, &cmd, true).await.unwrap();
-    let worker_requests = state.report_requests.lock().await.clone();
-
-    // Without an instrument the venue is not queried and the report is absent
-    let expected = expected.filter(|_| instrument_id.is_some());
-    assert_eq!(
-        inline.as_ref().map(|report| report.venue_order_id),
-        expected.map(VenueOrderId::from),
-    );
-    assert_eq!(
-        normalize_order_reports(worker.into_iter().collect()),
-        normalize_order_reports(inline.into_iter().collect()),
-    );
-    assert_eq!(worker_requests, inline_requests);
-    assert_eq!(inline_requests.is_empty(), instrument_id.is_none());
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::all(None, None)]
-#[case::start(Some(1_761_355_905_607), None)]
-#[case::end(None, Some(1_761_355_905_607))]
-#[tokio::test]
-async fn test_generate_order_status_reports_task_matches_inline(
-    #[case] start_ms: Option<u64>,
-    #[case] end_ms: Option<u64>,
-    #[values(false, true)] open_only: bool,
-    #[values(None, Some("ETHUSDT-LINEAR.BYBIT"))] instrument_id: Option<&str>,
-) {
-    let (mut client, state, _rx, _cache) = connected_report_client().await;
-    let cmd = GenerateOrderStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        open_only,
-        instrument_id.map(InstrumentId::from),
-        start_ms.map(|ms| UnixNanos::from(ms * 1_000_000)),
-        end_ms.map(|ms| UnixNanos::from(ms * 1_000_000)),
-        None,
-        None,
-    );
-
-    let inline = generate_order_reports(&client, &cmd, false).await.unwrap();
-    let inline_requests = std::mem::take(&mut *state.report_requests.lock().await);
-    let worker = generate_order_reports(&client, &cmd, true).await.unwrap();
-    let worker_requests = state.report_requests.lock().await.clone();
-
-    assert!(!inline.is_empty() || end_ms.is_some());
-    assert!(inline.iter().all(|report| {
-        start_ms.is_none_or(|ms| report.ts_last >= UnixNanos::from(ms * 1_000_000))
-            && end_ms.is_none_or(|ms| report.ts_last <= UnixNanos::from(ms * 1_000_000))
-    }));
-    assert_eq!(
-        normalize_order_reports(worker),
-        normalize_order_reports(inline),
-    );
-    assert_eq!(worker_requests, inline_requests);
-    assert_eq!(
-        inline_requests
-            .iter()
-            .any(|request| request.starts_with("/v5/order/history")),
-        !open_only,
-    );
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::all(None, None, 2)]
-#[case::instrument(Some("BTCUSDT-LINEAR.BYBIT"), None, 2)]
-#[case::venue_order(None, Some("8c065341-7b52-4ca9-ac2c-37e31ac55c94"), 1)]
-#[case::unknown_venue_order(None, Some("unknown-order"), 0)]
-#[tokio::test]
-async fn test_generate_fill_reports_task_matches_inline(
-    #[case] instrument_id: Option<&str>,
-    #[case] venue_order_id: Option<&str>,
-    #[case] expected: usize,
-) {
-    let (mut client, state, _rx, _cache) = connected_report_client().await;
-    let cmd = GenerateFillReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        instrument_id.map(InstrumentId::from),
-        venue_order_id.map(VenueOrderId::from),
-        None,
-        None,
-        None,
-        None,
-    );
-
-    let inline = generate_fills(&client, cmd.clone(), false).await.unwrap();
-    let inline_requests = std::mem::take(&mut *state.report_requests.lock().await);
-    let worker = generate_fills(&client, cmd, true).await.unwrap();
-    let worker_requests = state.report_requests.lock().await.clone();
-
-    assert_eq!(inline.len(), expected);
-    assert_eq!(
-        normalize_fill_reports(worker),
-        normalize_fill_reports(inline)
-    );
-    assert_eq!(worker_requests, inline_requests);
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::all(None)]
-#[case::linear(Some("BTCUSDT-LINEAR.BYBIT"))]
-#[tokio::test]
-async fn test_generate_position_status_reports_task_matches_inline(
-    #[case] instrument_id: Option<&str>,
-) {
-    let (mut client, state, _rx, _cache) = connected_report_client().await;
-    let cmd = GeneratePositionStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        instrument_id.map(InstrumentId::from),
-        None,
-        None,
-        None,
-        None,
-    );
-
-    let inline = generate_positions(&client, &cmd, false).await.unwrap();
-    let inline_requests = std::mem::take(&mut *state.report_requests.lock().await);
-    let worker = generate_positions(&client, &cmd, true).await.unwrap();
-    let worker_requests = state.report_requests.lock().await.clone();
-
-    assert!(!inline.is_empty());
-    assert_eq!(
-        normalize_position_reports(worker),
-        normalize_position_reports(inline),
-    );
-    assert_eq!(worker_requests, inline_requests);
-
-    client.disconnect().await.unwrap();
-}
-
 #[rstest]
 #[tokio::test]
-async fn test_report_tasks_propagate_venue_errors(#[values(false, true)] worker: bool) {
-    let (mut client, state, _rx, _cache) = connected_report_client().await;
-    state.fail_reports.store(true, Ordering::Relaxed);
-    let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
-
-    let order_cmd = GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(instrument_id),
-        Some(ClientOrderId::from("client-open-1")),
-        None,
-        None,
-        None,
-    );
-    let orders_cmd = GenerateOrderStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let fills_cmd = GenerateFillReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(instrument_id),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-    let positions_cmd = GeneratePositionStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    assert!(
-        generate_order_report(&client, &order_cmd, worker)
-            .await
-            .is_err()
-    );
-    assert!(
-        generate_order_reports(&client, &orders_cmd, worker)
-            .await
-            .is_err()
-    );
-    assert!(generate_fills(&client, fills_cmd, worker).await.is_err());
-    assert!(
-        generate_positions(&client, &positions_cmd, worker)
-            .await
-            .is_err()
-    );
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[case::cached_before_finish(true)]
-#[case::cached_after_finish(false)]
-#[tokio::test]
-async fn test_generate_order_status_report_task_caches_identity_on_finish(
-    #[case] cached_before_finish: bool,
-) {
-    let (mut client, state, mut rx, cache) = connected_report_client().await;
-    client.start().unwrap();
-    drain_execution_events(&mut rx).await;
-
-    let client_order_id = ClientOrderId::from("client-open-1");
-    let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
-    let cmd = GenerateOrderStatusReport::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        Some(instrument_id),
-        Some(client_order_id),
-        None,
-        None,
-        None,
-    );
-    let ExecutionReportTask { collection, result } =
-        client.generate_order_status_report_task(&cmd).unwrap();
-    run_report_collection(collection).await;
-
-    // The order reaches the cache after collection ends, so only finish can observe it
-    let order = report_order(client_order_id, instrument_id);
-    if cached_before_finish {
-        cache
-            .borrow_mut()
-            .add_order(order.clone(), None, Some(*BYBIT_CLIENT_ID), false)
-            .unwrap();
-    }
-
-    let report = result.await.unwrap().unwrap();
-    assert_eq!(report.client_order_id, Some(client_order_id));
-
-    if !cached_before_finish {
-        cache
-            .borrow_mut()
-            .add_order(order.clone(), None, Some(*BYBIT_CLIENT_ID), false)
-            .unwrap();
-    }
-
-    state.private_pushes.lock().await.push(ws_order_update(
-        "open-order-1",
-        "client-open-1",
-        "ETHUSDT",
-    ));
-    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("timed out waiting for order update")
-        .expect("channel closed");
-
-    // A cached identity makes the stream emit lifecycle events for the tracked order
-    match event {
-        ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) if cached_before_finish => {
-            assert_eq!(accepted.client_order_id, client_order_id);
-            assert_eq!(accepted.strategy_id, order.strategy_id());
-            assert_eq!(accepted.instrument_id, instrument_id);
-        }
-        ExecutionEvent::Report(ExecutionReport::Order(report)) if !cached_before_finish => {
-            assert_eq!(report.client_order_id, Some(client_order_id));
-        }
-        other => panic!("unexpected event {other:?} (cached_before_finish={cached_before_finish})"),
-    }
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_canceled_order_status_reports_task_skips_finish() {
-    let (mut client, _state, _rx, cache) = connected_report_client().await;
-    let client_order_id = ClientOrderId::from("client-open-1");
-    let instrument_id = InstrumentId::from("ETHUSDT-LINEAR.BYBIT");
-    cache
-        .borrow_mut()
-        .add_order(
-            report_order(client_order_id, instrument_id),
-            None,
-            Some(*BYBIT_CLIENT_ID),
-            false,
-        )
-        .unwrap();
-    let cmd = GenerateOrderStatusReports::new(
-        UUID4::new(),
-        UnixNanos::default(),
-        true,
-        Some(instrument_id),
-        None,
-        None,
-        None,
-        None,
-    );
-
-    let ExecutionReportTask { collection, result } =
-        client.generate_order_status_reports_task(&cmd).unwrap();
-    drop(collection);
-
-    let error = result.await.unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "report collection stopped without a result"
-    );
-
-    client.disconnect().await.unwrap();
-}
-
-#[rstest]
-#[tokio::test]
-async fn test_generate_order_status_reports_open_only_retains_recent_closed(
-    #[values(false, true)] worker: bool,
-) {
+async fn test_generate_order_status_reports_open_only_retains_recent_closed() {
     let (addr, state) = start_test_server().await.unwrap();
     let (mut client, _rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("BYBIT-001"));
@@ -1867,7 +1257,8 @@ async fn test_generate_order_status_reports_open_only_retains_recent_closed(
         None,
         None,
     );
-    let reports = generate_order_reports(&client, &command, worker)
+    let reports = client
+        .generate_order_status_reports(&command)
         .await
         .unwrap();
 

@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 use nautilus_common::{
     cache::InstrumentLookupError,
-    clients::{ExecutionClient, ExecutionReportTask},
+    clients::ExecutionClient,
     live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -209,13 +209,6 @@ impl KrakenFuturesExecutionClient {
     #[must_use]
     pub fn emitter(&self) -> &ExecutionEventEmitter {
         &self.emitter
-    }
-
-    fn report_client(&self) -> KrakenFuturesReportClient {
-        KrakenFuturesReportClient {
-            account_id: self.core.account_id,
-            http: self.http.clone(),
-        }
     }
 
     fn spawn_task<F>(&self, description: &'static str, fut: F)
@@ -759,112 +752,185 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         Ok(())
     }
 
-    fn generate_order_status_report_task(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
-        let client = self.report_client();
-        let cached_order = self.get_cached_order_for_status_command(cmd);
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move {
-                client
-                    .collect_order_status_report(&command, cached_order)
-                    .await
-            },
-            Ok,
-        ))
-    }
-
-    fn generate_order_status_reports_task(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
-        let client = self.report_client();
-        // Collection cannot read the cache, so snapshot the cached open orders on the core thread
-        let open_orders = cmd
-            .open_only
-            .then(|| self.cached_open_orders(cmd.instrument_id));
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move {
-                let reports = client.collect_order_status_reports(&command).await?;
-                match open_orders {
-                    Some(open_orders) => {
-                        client
-                            .extend_order_status_reports(reports, &open_orders)
-                            .await
-                    }
-                    None => Ok(reports),
-                }
-            },
-            Ok,
-        ))
-    }
-
-    fn generate_fill_reports_task(
-        &self,
-        cmd: &GenerateFillReports,
-    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_fill_reports(&command).await },
-            Ok,
-        ))
-    }
-
-    fn generate_position_status_reports_task(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
-        let client = self.report_client();
-        let command = cmd.clone();
-        Some(ExecutionReportTask::new(
-            async move { client.collect_position_status_reports(&command).await },
-            Ok,
-        ))
-    }
-
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        self.report_client()
-            .collect_order_status_report(cmd, self.get_cached_order_for_status_command(cmd))
-            .await
+        log::debug!(
+            "Generating order status report: venue_order_id={:?}, client_order_id={:?}",
+            cmd.venue_order_id,
+            cmd.client_order_id
+        );
+
+        let account_id = self.core.account_id;
+        let reports = self
+            .http
+            .request_order_status_reports(account_id, None, None, None, false)
+            .await?;
+
+        // Match by venue_order_id or client_order_id (comparing truncated form
+        // since Kraken stores the truncated cl_ord_id for long IDs)
+        let matched = reports.into_iter().find(|r| {
+            cmd.venue_order_id
+                .is_some_and(|id| r.venue_order_id.as_str() == id.as_str())
+                || cmd.client_order_id.is_some_and(|id| {
+                    r.client_order_id
+                        .as_ref()
+                        .is_some_and(|r_id| r_id.as_str() == truncate_cl_ord_id(&id))
+                })
+        });
+
+        if matched.is_some() {
+            return Ok(matched);
+        }
+
+        let Some(order) = self.get_cached_order_for_status_command(cmd) else {
+            return Ok(None);
+        };
+
+        // Held orders never appear on /openorders; query the 5-second window
+        let order_ids: Vec<String> = cmd
+            .venue_order_id
+            .or(order.venue_order_id())
+            .map(|id| id.to_string())
+            .into_iter()
+            .collect();
+        let cli_ord_ids: Vec<String> = cmd
+            .client_order_id
+            .map(|id| truncate_cl_ord_id(&id))
+            .into_iter()
+            .collect();
+
+        let recent_reports = self
+            .http
+            .request_orders_status_reports(account_id, &order_ids, &cli_ord_ids)
+            .await?;
+
+        let matched_recent = recent_reports
+            .iter()
+            .find(|report| {
+                cmd.venue_order_id
+                    .is_some_and(|id| report.venue_order_id == id)
+                    || cmd.client_order_id.is_some_and(|id| {
+                        report
+                            .client_order_id
+                            .as_ref()
+                            .is_some_and(|report_id| report_id.as_str() == truncate_cl_ord_id(&id))
+                    })
+            })
+            .cloned();
+
+        // Window filled reports have no avg_px; price them from fills below
+        if matched_recent
+            .as_ref()
+            .is_some_and(|report| report.order_status != OrderStatus::Filled)
+        {
+            return Ok(matched_recent);
+        }
+
+        let now = Timestamp::now();
+        let start = now - Duration::from_secs(5 * 60);
+        let fills = self
+            .http
+            .request_fill_reports(
+                account_id,
+                Some(order.instrument_id()),
+                Some(start),
+                Some(now),
+            )
+            .await?;
+
+        match (
+            synthesize_filled_order_status_report(cmd, &order, &fills),
+            matched_recent,
+        ) {
+            (Some(report), _) => Ok(Some(report)),
+            // Unpriced filled reports would close at the order price
+            (None, Some(_)) => anyhow::bail!(
+                "Order {} fully executed in the orders-status window without visible \
+                 fills; deferring until the fills feed prices it",
+                order.client_order_id(),
+            ),
+            (None, None) => Ok(None),
+        }
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let client = self.report_client();
-        let reports = client.collect_order_status_reports(cmd).await?;
+        log::debug!(
+            "Generating order status reports: instrument_id={:?}, open_only={}",
+            cmd.instrument_id,
+            cmd.open_only
+        );
 
-        if !cmd.open_only {
-            return Ok(reports);
+        let account_id = self.core.account_id;
+        let start = cmd.start.map(Timestamp::from);
+        let end = cmd.end.map(Timestamp::from);
+        let mut reports = self
+            .http
+            .request_order_status_reports(account_id, cmd.instrument_id, start, end, cmd.open_only)
+            .await?;
+
+        if cmd.open_only {
+            let extension = self
+                .reports_for_open_orders_absent_from_venue(account_id, cmd.instrument_id, &reports)
+                .await?;
+
+            for report in extension {
+                if report.order_status == OrderStatus::Filled {
+                    log::debug!(
+                        "Deferring fully executed order {} from the bulk response: fills-paired \
+                         pricing applies",
+                        report.venue_order_id,
+                    );
+                    continue;
+                }
+
+                reports.push(report);
+            }
         }
 
-        let open_orders = self.cached_open_orders(cmd.instrument_id);
-        client
-            .extend_order_status_reports(reports, &open_orders)
-            .await
+        Ok(reports)
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        self.report_client().collect_fill_reports(&cmd).await
+        log::debug!(
+            "Generating fill reports: instrument_id={:?}",
+            cmd.instrument_id
+        );
+
+        let account_id = self.core.account_id;
+        let start = cmd.start.map(Timestamp::from);
+        let end = cmd.end.map(Timestamp::from);
+        let mut reports = self
+            .http
+            .request_fill_reports(account_id, cmd.instrument_id, start, end)
+            .await?;
+
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id == venue_order_id);
+        }
+
+        Ok(reports)
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        self.report_client()
-            .collect_position_status_reports(cmd)
+        log::debug!(
+            "Generating position status reports: instrument_id={:?}",
+            cmd.instrument_id
+        );
+
+        let account_id = self.core.account_id;
+        self.http
+            .request_position_status_reports(account_id, cmd.instrument_id)
             .await
     }
 
@@ -888,10 +954,8 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             .http
             .request_order_status_reports_checked(account_id, None, start, None, true)
             .await?;
-        let open_orders = self.cached_open_orders(None);
         let extension = self
-            .report_client()
-            .reports_for_open_orders_absent_from_venue(&order_reports, &open_orders)
+            .reports_for_open_orders_absent_from_venue(account_id, None, &order_reports)
             .await?;
 
         // Snapshot recon would infer uncovered fills at the order price
@@ -1473,221 +1537,6 @@ fn handle_cancel_failure(
 }
 
 impl KrakenFuturesExecutionClient {
-    /// Returns the cached open futures orders, read on the core thread.
-    ///
-    /// Spot and Futures share the KRAKEN venue and one cache, so spot orders are skipped.
-    fn cached_open_orders(&self, instrument_id: Option<InstrumentId>) -> Vec<CachedOpenOrder> {
-        let cache = self.core.cache();
-        cache
-            .orders_open(
-                Some(&*KRAKEN_VENUE),
-                instrument_id.as_ref(),
-                None,
-                None,
-                None,
-            )
-            .into_iter()
-            .filter(|order| {
-                product_type_from_symbol(order.instrument_id().symbol.inner().as_str())
-                    == KrakenProductType::Futures
-            })
-            .map(|order| CachedOpenOrder {
-                client_order_id: order.client_order_id(),
-                venue_order_id: order.venue_order_id(),
-            })
-            .collect()
-    }
-
-    fn get_cached_order_for_status_command(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-    ) -> Option<OrderAny> {
-        let cache = self.core.cache();
-
-        if let Some(client_order_id) = cmd.client_order_id {
-            return cache.order(&client_order_id).map(|o| o.clone());
-        }
-
-        let venue_order_id = cmd.venue_order_id?;
-        let client_order_id = *cache.client_order_id(&venue_order_id)?;
-        cache.order(&client_order_id).map(|o| o.clone())
-    }
-}
-
-/// Identity of a cached open futures order, captured on the core thread.
-#[derive(Debug, Clone, Copy)]
-struct CachedOpenOrder {
-    client_order_id: ClientOrderId,
-    venue_order_id: Option<VenueOrderId>,
-}
-
-/// Owned report collection for the futures client.
-///
-/// Holds no cache or `Rc` state, so report tasks can run it on a runtime worker. Cache state it
-/// needs is captured on the core thread and passed in. The inline report methods call the same
-/// collection, keeping filters, report identity, and errors shared.
-#[derive(Debug)]
-struct KrakenFuturesReportClient {
-    account_id: AccountId,
-    http: KrakenFuturesHttpClient,
-}
-
-impl KrakenFuturesReportClient {
-    async fn collect_order_status_report(
-        &self,
-        cmd: &GenerateOrderStatusReport,
-        cached_order: Option<OrderAny>,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        log::debug!(
-            "Generating order status report: venue_order_id={:?}, client_order_id={:?}",
-            cmd.venue_order_id,
-            cmd.client_order_id
-        );
-
-        let account_id = self.account_id;
-        let reports = self
-            .http
-            .request_order_status_reports(account_id, None, None, None, false)
-            .await?;
-
-        // Match by venue_order_id or client_order_id (comparing truncated form
-        // since Kraken stores the truncated cl_ord_id for long IDs)
-        let matched = reports.into_iter().find(|r| {
-            cmd.venue_order_id
-                .is_some_and(|id| r.venue_order_id.as_str() == id.as_str())
-                || cmd.client_order_id.is_some_and(|id| {
-                    r.client_order_id
-                        .as_ref()
-                        .is_some_and(|r_id| r_id.as_str() == truncate_cl_ord_id(&id))
-                })
-        });
-
-        if matched.is_some() {
-            return Ok(matched);
-        }
-
-        let Some(order) = cached_order else {
-            return Ok(None);
-        };
-
-        // Held orders never appear on /openorders; query the 5-second window
-        let order_ids: Vec<String> = cmd
-            .venue_order_id
-            .or(order.venue_order_id())
-            .map(|id| id.to_string())
-            .into_iter()
-            .collect();
-        let cli_ord_ids: Vec<String> = cmd
-            .client_order_id
-            .map(|id| truncate_cl_ord_id(&id))
-            .into_iter()
-            .collect();
-
-        let recent_reports = self
-            .http
-            .request_orders_status_reports(account_id, &order_ids, &cli_ord_ids)
-            .await?;
-
-        let matched_recent = recent_reports
-            .iter()
-            .find(|report| {
-                cmd.venue_order_id
-                    .is_some_and(|id| report.venue_order_id == id)
-                    || cmd.client_order_id.is_some_and(|id| {
-                        report
-                            .client_order_id
-                            .as_ref()
-                            .is_some_and(|report_id| report_id.as_str() == truncate_cl_ord_id(&id))
-                    })
-            })
-            .cloned();
-
-        // Window filled reports have no avg_px; price them from fills below
-        if matched_recent
-            .as_ref()
-            .is_some_and(|report| report.order_status != OrderStatus::Filled)
-        {
-            return Ok(matched_recent);
-        }
-
-        let now = Timestamp::now();
-        let start = now - Duration::from_secs(5 * 60);
-        let fills = self
-            .http
-            .request_fill_reports(
-                account_id,
-                Some(order.instrument_id()),
-                Some(start),
-                Some(now),
-            )
-            .await?;
-
-        match (
-            synthesize_filled_order_status_report(cmd, &order, &fills),
-            matched_recent,
-        ) {
-            (Some(report), _) => Ok(Some(report)),
-            // Unpriced filled reports would close at the order price
-            (None, Some(_)) => anyhow::bail!(
-                "Order {} fully executed in the orders-status window without visible \
-                 fills; deferring until the fills feed prices it",
-                order.client_order_id(),
-            ),
-            (None, None) => Ok(None),
-        }
-    }
-
-    async fn collect_order_status_reports(
-        &self,
-        cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        log::debug!(
-            "Generating order status reports: instrument_id={:?}, open_only={}",
-            cmd.instrument_id,
-            cmd.open_only
-        );
-
-        let start = cmd.start.map(Timestamp::from);
-        let end = cmd.end.map(Timestamp::from);
-        self.http
-            .request_order_status_reports(
-                self.account_id,
-                cmd.instrument_id,
-                start,
-                end,
-                cmd.open_only,
-            )
-            .await
-    }
-
-    /// Extends open-only order reports with `/orders/status` reports for cached open orders.
-    ///
-    /// Fully executed window entries are dropped, since fills-paired pricing applies to them.
-    async fn extend_order_status_reports(
-        &self,
-        mut reports: Vec<OrderStatusReport>,
-        open_orders: &[CachedOpenOrder],
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let extension = self
-            .reports_for_open_orders_absent_from_venue(&reports, open_orders)
-            .await?;
-
-        for report in extension {
-            if report.order_status == OrderStatus::Filled {
-                log::debug!(
-                    "Deferring fully executed order {} from the bulk response: fills-paired \
-                     pricing applies",
-                    report.venue_order_id,
-                );
-                continue;
-            }
-
-            reports.push(report);
-        }
-
-        Ok(reports)
-    }
-
     /// Returns `/orders/status` reports for cached-open orders the given
     /// venue reports do not cover.
     ///
@@ -1704,24 +1553,41 @@ impl KrakenFuturesReportClient {
     /// it, so callers defer rather than treat the orders as missing.
     async fn reports_for_open_orders_absent_from_venue(
         &self,
+        account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
         reported: &[OrderStatusReport],
-        open_orders: &[CachedOpenOrder],
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
         let mut order_ids = Vec::new();
         let mut cli_ord_ids = Vec::new();
 
-        for order in open_orders {
-            match order.venue_order_id {
-                Some(venue_order_id) => {
-                    let already_reported = reported
-                        .iter()
-                        .any(|report| report.venue_order_id == venue_order_id);
-                    if !already_reported {
-                        order_ids.push(venue_order_id.to_string());
-                    }
+        {
+            let cache = self.core.cache();
+            for order in cache.orders_open(
+                Some(&*KRAKEN_VENUE),
+                instrument_id.as_ref(),
+                None,
+                None,
+                None,
+            ) {
+                // Spot and Futures share the KRAKEN venue and one cache
+                if product_type_from_symbol(order.instrument_id().symbol.inner().as_str())
+                    != KrakenProductType::Futures
+                {
+                    continue;
                 }
-                None => {
-                    cli_ord_ids.push(truncate_cl_ord_id(&order.client_order_id));
+
+                match order.venue_order_id() {
+                    Some(venue_order_id) => {
+                        let already_reported = reported
+                            .iter()
+                            .any(|report| report.venue_order_id == venue_order_id);
+                        if !already_reported {
+                            order_ids.push(venue_order_id.to_string());
+                        }
+                    }
+                    None => {
+                        cli_ord_ids.push(truncate_cl_ord_id(&order.client_order_id()));
+                    }
                 }
             }
         }
@@ -1740,7 +1606,7 @@ impl KrakenFuturesReportClient {
         for chunk in order_ids.chunks(FUTURES_ORDERS_STATUS_LIMIT) {
             reports.extend(
                 self.http
-                    .request_orders_status_reports(self.account_id, chunk, &[])
+                    .request_orders_status_reports(account_id, chunk, &[])
                     .await?,
             );
         }
@@ -1748,7 +1614,7 @@ impl KrakenFuturesReportClient {
         for chunk in cli_ord_ids.chunks(FUTURES_ORDERS_STATUS_LIMIT) {
             reports.extend(
                 self.http
-                    .request_orders_status_reports(self.account_id, &[], chunk)
+                    .request_orders_status_reports(account_id, &[], chunk)
                     .await?,
             );
         }
@@ -1756,41 +1622,19 @@ impl KrakenFuturesReportClient {
         Ok(reports)
     }
 
-    async fn collect_fill_reports(
+    fn get_cached_order_for_status_command(
         &self,
-        cmd: &GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        log::debug!(
-            "Generating fill reports: instrument_id={:?}",
-            cmd.instrument_id
-        );
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<OrderAny> {
+        let cache = self.core.cache();
 
-        let start = cmd.start.map(Timestamp::from);
-        let end = cmd.end.map(Timestamp::from);
-        let mut reports = self
-            .http
-            .request_fill_reports(self.account_id, cmd.instrument_id, start, end)
-            .await?;
-
-        if let Some(venue_order_id) = cmd.venue_order_id {
-            reports.retain(|report| report.venue_order_id == venue_order_id);
+        if let Some(client_order_id) = cmd.client_order_id {
+            return cache.order(&client_order_id).map(|o| o.clone());
         }
 
-        Ok(reports)
-    }
-
-    async fn collect_position_status_reports(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        log::debug!(
-            "Generating position status reports: instrument_id={:?}",
-            cmd.instrument_id
-        );
-
-        self.http
-            .request_position_status_reports(self.account_id, cmd.instrument_id)
-            .await
+        let venue_order_id = cmd.venue_order_id?;
+        let client_order_id = *cache.client_order_id(&venue_order_id)?;
+        cache.order(&client_order_id).map(|o| o.clone())
     }
 }
 
