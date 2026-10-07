@@ -516,6 +516,7 @@ ruff:  #-- Run ruff linter with automatic fixes
 	VIRTUAL_ENV= uv run --project python --no-sync ruff check . --config python/pyproject.toml --fix --force-exclude
 
 .PHONY: typos
+.PHONY: typos
 typos:  #-- Run the typos spell checker on all tracked files
 	@if ! command -v typos >/dev/null 2>&1; then \
 		echo "typos is not installed. You can install it using 'cargo install typos-cli'"; \
