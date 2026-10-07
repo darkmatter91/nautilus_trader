@@ -487,15 +487,15 @@ async fn select_markets(args: &StressArgs) -> Vec<String> {
         locale: None,
     };
 
-    let catalogues: Vec<MarketCatalogue> = client
+    let catalogs: Vec<MarketCatalogue> = client
         .send_betting(METHOD_LIST_MARKET_CATALOGUE, &params)
         .await
-        .expect("market catalogue loads");
+        .expect("market catalog loads");
     client.disconnect().await;
 
-    let markets = catalogues
+    let markets = catalogs
         .into_iter()
-        .map(|catalogue| catalogue.market_id)
+        .map(|catalog| catalog.market_id)
         .collect::<Vec<_>>();
     assert!(
         !markets.is_empty(),

@@ -867,8 +867,8 @@ mod tests {
     #[rstest]
     fn test_list_market_catalogue_with_runner_metadata() {
         let data = load_test_json("rest/list_market_catalogue.json");
-        let catalogue: MarketCatalogue = serde_json::from_str(&data).unwrap();
-        let runners = catalogue.runners.expect("runners present");
+        let catalog: MarketCatalogue = serde_json::from_str(&data).unwrap();
+        let runners = catalog.runners.expect("runners present");
         let meta = runners[0].metadata.as_ref().expect("metadata present");
         assert!(meta.contains_key("AGE"));
         assert!(meta.contains_key("CLOTH_NUMBER"));
@@ -995,7 +995,7 @@ mod tests {
     #[rstest]
     fn test_betting_market_catalogue() {
         let data = load_test_json("rest/betting_list_market_catalogue.json");
-        let catalogues: Vec<MarketCatalogue> = serde_json::from_str(&data).unwrap();
-        assert!(!catalogues.is_empty());
+        let catalogs: Vec<MarketCatalogue> = serde_json::from_str(&data).unwrap();
+        assert!(!catalogs.is_empty());
     }
 }

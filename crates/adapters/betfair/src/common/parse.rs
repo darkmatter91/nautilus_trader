@@ -156,19 +156,19 @@ pub fn make_customer_order_ref_legacy(client_order_id: &str) -> String {
 ///
 /// Returns an error if required fields are missing or instrument construction fails.
 pub fn parse_market_catalogue(
-    catalogue: &MarketCatalogue,
+    catalog: &MarketCatalogue,
     currency: Currency,
     ts_init: UnixNanos,
     min_notional: Option<Money>,
 ) -> anyhow::Result<Vec<InstrumentAny>> {
-    let runners = catalogue
+    let runners = catalog
         .runners
         .as_ref()
         .context("MarketCatalogue missing runners")?;
 
-    let market_id = &catalogue.market_id;
+    let market_id = &catalog.market_id;
 
-    let (event_type_id, event_type_name) = match &catalogue.event_type {
+    let (event_type_id, event_type_name) = match &catalog.event_type {
         Some(et) => (
             et.id
                 .as_ref()
@@ -179,7 +179,7 @@ pub fn parse_market_catalogue(
         None => (0, Ustr::from("")),
     };
 
-    let (competition_id, competition_name) = match &catalogue.competition {
+    let (competition_id, competition_name) = match &catalog.competition {
         Some(c) => (
             c.id.as_ref()
                 .and_then(|id| id.parse::<u64>().ok())
@@ -189,7 +189,7 @@ pub fn parse_market_catalogue(
         None => (0, Ustr::from("")),
     };
 
-    let (event_id, event_name, event_country_code, event_open_date) = match &catalogue.event {
+    let (event_id, event_name, event_country_code, event_open_date) = match &catalog.event {
         Some(e) => {
             let eid =
                 e.id.as_ref()
@@ -207,7 +207,7 @@ pub fn parse_market_catalogue(
         None => (0, Ustr::from(""), Ustr::from(""), UnixNanos::default()),
     };
 
-    let (betting_type, market_type) = match &catalogue.description {
+    let (betting_type, market_type) = match &catalog.description {
         Some(desc) => (
             Ustr::from(&format!("{}", desc.betting_type)),
             desc.market_type,
@@ -218,8 +218,8 @@ pub fn parse_market_catalogue(
         ),
     };
 
-    let market_name = Ustr::from(&catalogue.market_name);
-    let market_start_time = catalogue
+    let market_name = Ustr::from(&catalog.market_name);
+    let market_start_time = catalog
         .market_start_time
         .as_deref()
         .and_then(|t| parse_betfair_timestamp(t).ok())
@@ -628,9 +628,9 @@ mod tests {
     #[rstest]
     fn test_parse_market_catalogue() {
         let data = load_test_json("rest/list_market_catalogue.json");
-        let catalogue: MarketCatalogue = serde_json::from_str(&data).unwrap();
+        let catalog: MarketCatalogue = serde_json::from_str(&data).unwrap();
         let instruments =
-            parse_market_catalogue(&catalogue, Currency::GBP(), UnixNanos::default(), None)
+            parse_market_catalogue(&catalog, Currency::GBP(), UnixNanos::default(), None)
                 .unwrap();
 
         assert_eq!(instruments.len(), 3);
@@ -656,11 +656,11 @@ mod tests {
     #[rstest]
     fn test_parse_market_catalogue_batch() {
         let data = load_test_json("rest/betting_list_market_catalogue.json");
-        let catalogues: Vec<MarketCatalogue> = serde_json::from_str(&data).unwrap();
+        let catalogs: Vec<MarketCatalogue> = serde_json::from_str(&data).unwrap();
 
         let mut total = 0;
 
-        for cat in &catalogues {
+        for cat in &catalogs {
             let instruments =
                 parse_market_catalogue(cat, Currency::GBP(), UnixNanos::default(), None).unwrap();
             total += instruments.len();

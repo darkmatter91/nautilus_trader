@@ -329,16 +329,16 @@ pub async fn load_instruments(
             locale: None,
         };
 
-        let catalogues: Vec<MarketCatalogue> = client
+        let catalogs: Vec<MarketCatalogue> = client
             .send_betting(METHOD_LIST_MARKET_CATALOGUE, &params)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        for catalogue in &catalogues {
-            match parse_market_catalogue(catalogue, currency, ts_init, min_notional) {
+        for catalog in &catalogs {
+            match parse_market_catalogue(catalog, currency, ts_init, min_notional) {
                 Ok(instruments) => all_instruments.extend(instruments),
                 Err(e) => {
-                    log::warn!("Failed to parse catalogue {}: {e}", catalogue.market_id);
+                    log::warn!("Failed to parse catalog {}: {e}", catalog.market_id);
                 }
             }
         }
@@ -496,15 +496,15 @@ impl InstrumentProvider for BetfairInstrumentProvider {
             locale: None,
         };
 
-        let catalogues: Vec<MarketCatalogue> = self
+        let catalogs: Vec<MarketCatalogue> = self
             .http_client
             .send_betting(METHOD_LIST_MARKET_CATALOGUE, &params)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        for catalogue in &catalogues {
+        for catalog in &catalogs {
             let instruments =
-                parse_market_catalogue(catalogue, self.currency, ts_init, self.min_notional)?;
+                parse_market_catalogue(catalog, self.currency, ts_init, self.min_notional)?;
 
             for inst in instruments {
                 self.store.add(inst);
