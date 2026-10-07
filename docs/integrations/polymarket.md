@@ -1371,6 +1371,16 @@ is as follows:
 - Generate missing orders to bring Nautilus execution state in line with positions reported by
   Polymarket.
 
+`LiveNode` collects single-order, bulk order, fill, and position reports on runtime workers. It
+resolves order identities, cached order evidence, and resolved balances on its main thread before
+collection. Bulk order reports then bind pending replacement legs and cap filled quantities against
+current cache state on the main thread. A worker fetches confirmed trades for that cap whenever a
+collected order could exceed its cached fill, so it can request them where the inline path, which
+decides after binding, would not. If the cache changes during collection so the main thread needs
+trades the worker skipped, the cap falls back to cached fills and logs a warning. The [report
+gate](#report-gating) is checked before collection and again on the main thread after it. Startup
+and post-reconnect mass status bypass these hooks.
+
 ### Position reports
 
 #### Report precision

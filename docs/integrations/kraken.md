@@ -576,6 +576,19 @@ window, so the engine sees the set as incomplete. `generate_order_status_reports
 `generate_fill_reports` return the records read up to the cap and do not expose a completeness
 flag.
 
+### Report collection
+
+`LiveNode` fetches single-order, bulk order, fill, and position reports over HTTP on runtime
+workers for both execution clients, then returns them on its main thread. The worker and inline
+paths share the same requests, filters, and errors. Startup and post-reconnect mass status bypass
+these hooks.
+
+The futures client reads the cache on the main thread when it creates the report task. It reads the
+cached order for a single-order report, and the cached open futures orders for an `open_only` bulk
+run. These drive the `/orders/status` lookups described under
+[Maker Protection](#maker-protection-futures). The next report run picks up any order cached after
+the task starts.
+
 ### Spot reconciliation
 
 **Order status reports:**

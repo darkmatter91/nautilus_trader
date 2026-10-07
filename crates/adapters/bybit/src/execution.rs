@@ -26,7 +26,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -346,37 +346,15 @@ impl BybitExecutionClient {
     }
 
     fn get_product_type_for_instrument(&self, instrument_id: InstrumentId) -> BybitProductType {
-        BybitProductType::from_suffix(instrument_id.symbol.as_str()).unwrap_or_else(|| {
-            log::warn!("No product-type suffix on {instrument_id}, defaulting to Linear");
-            BybitProductType::Linear
-        })
+        product_type_for_instrument(instrument_id)
     }
 
-    const fn provides_bulk_position_coverage_for_product_type(
-        product_type: BybitProductType,
-    ) -> bool {
-        !matches!(product_type, BybitProductType::Spot)
-    }
-
-    async fn generate_bulk_position_status_reports(
-        &self,
-        product_types: Vec<BybitProductType>,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let mut reports = Vec::new();
-
-        for product_type in product_types {
-            if !Self::provides_bulk_position_coverage_for_product_type(product_type) {
-                continue;
-            }
-
-            let mut fetched = self
-                .http_client
-                .request_position_status_reports(self.core.account_id, product_type, None)
-                .await?;
-            reports.append(&mut fetched);
+    fn report_client(&self) -> BybitReportClient {
+        BybitReportClient {
+            account_id: self.core.account_id,
+            http_client: self.http_client.clone(),
+            product_types: self.product_types(),
         }
-
-        Ok(reports)
     }
 
     fn resolve_position_idx(
@@ -718,7 +696,7 @@ impl ExecutionClient for BybitExecutionClient {
         };
 
         self.product_types().contains(&product_type)
-            && Self::provides_bulk_position_coverage_for_product_type(product_type)
+            && provides_bulk_position_coverage_for_product_type(product_type)
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
@@ -1034,39 +1012,76 @@ impl ExecutionClient for BybitExecutionClient {
         Ok(())
     }
 
+    fn generate_order_status_report_task(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+        let client = self.report_client();
+        let core = self.core.clone();
+        let dispatch_state = Arc::clone(&self.dispatch_state);
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_report(&command).await },
+            move |report| {
+                if let Some(report) = &report {
+                    cache_reconciliation_order_identity(&core, &dispatch_state, report);
+                }
+                Ok(report)
+            },
+        ))
+    }
+
+    fn generate_order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        let client = self.report_client();
+        let core = self.core.clone();
+        let dispatch_state = Arc::clone(&self.dispatch_state);
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_reports(&command).await },
+            move |reports| {
+                for report in &reports {
+                    cache_reconciliation_order_identity(&core, &dispatch_state, report);
+                }
+                Ok(reports)
+            },
+        ))
+    }
+
+    fn generate_fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_fill_reports(command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_position_status_reports_task(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_position_status_reports(&command).await },
+            Ok,
+        ))
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let Some(instrument_id) = cmd.instrument_id else {
-            log::warn!("generate_order_status_report requires instrument_id: {cmd}");
-            return Ok(None);
-        };
-
-        let product_type = self.get_product_type_for_instrument(instrument_id);
-
-        let mut reports = self
-            .http_client
-            .request_order_status_reports(
-                self.core.account_id,
-                product_type,
-                Some(instrument_id),
-                false,
-                None,
-                None,
-                None,
-            )
+        let report = self
+            .report_client()
+            .collect_order_status_report(cmd)
             .await?;
-
-        if let Some(client_order_id) = cmd.client_order_id {
-            reports.retain(|report| report.client_order_id == Some(client_order_id));
-        }
-
-        if let Some(venue_order_id) = cmd.venue_order_id {
-            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
-        }
-
-        let report = reports.into_iter().next();
         if let Some(report) = &report {
             self.cache_reconciliation_order_identity(report);
         }
@@ -1078,48 +1093,10 @@ impl ExecutionClient for BybitExecutionClient {
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let mut reports = Vec::new();
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            let product_type = self.get_product_type_for_instrument(instrument_id);
-            let mut fetched = self
-                .http_client
-                .request_order_status_reports(
-                    self.core.account_id,
-                    product_type,
-                    Some(instrument_id),
-                    cmd.open_only,
-                    None,
-                    None,
-                    None,
-                )
-                .await?;
-            reports.append(&mut fetched);
-        } else {
-            for product_type in self.product_types() {
-                let mut fetched = self
-                    .http_client
-                    .request_order_status_reports(
-                        self.core.account_id,
-                        product_type,
-                        None,
-                        cmd.open_only,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await?;
-                reports.append(&mut fetched);
-            }
-        }
-
-        if let Some(start) = cmd.start {
-            reports.retain(|r| r.ts_last >= start);
-        }
-
-        if let Some(end) = cmd.end {
-            reports.retain(|r| r.ts_last <= end);
-        }
+        let reports = self
+            .report_client()
+            .collect_order_status_reports(cmd)
+            .await?;
 
         for report in &reports {
             self.cache_reconciliation_order_identity(report);
@@ -1132,65 +1109,16 @@ impl ExecutionClient for BybitExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let start_ms = nanos_to_millis(cmd.start);
-        let end_ms = nanos_to_millis(cmd.end);
-        let mut reports = Vec::new();
-
-        if let Some(instrument_id) = cmd.instrument_id {
-            let product_type = self.get_product_type_for_instrument(instrument_id);
-            let mut fetched = self
-                .http_client
-                .request_fill_reports(
-                    self.core.account_id,
-                    product_type,
-                    Some(instrument_id),
-                    start_ms,
-                    end_ms,
-                    None,
-                )
-                .await?;
-            reports.append(&mut fetched);
-        } else {
-            for product_type in self.product_types() {
-                let mut fetched = self
-                    .http_client
-                    .request_fill_reports(
-                        self.core.account_id,
-                        product_type,
-                        None,
-                        start_ms,
-                        end_ms,
-                        None,
-                    )
-                    .await?;
-                reports.append(&mut fetched);
-            }
-        }
-
-        if let Some(venue_order_id) = cmd.venue_order_id {
-            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
-        }
-
-        Ok(reports)
+        self.report_client().collect_fill_reports(cmd).await
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        if let Some(instrument_id) = cmd.instrument_id {
-            let product_type = self.get_product_type_for_instrument(instrument_id);
-            self.http_client
-                .request_position_status_reports(
-                    self.core.account_id,
-                    product_type,
-                    Some(instrument_id),
-                )
-                .await
-        } else {
-            self.generate_bulk_position_status_reports(self.product_types())
-                .await
-        }
+        self.report_client()
+            .collect_position_status_reports(cmd)
+            .await
     }
 
     async fn generate_mass_status(
@@ -1222,7 +1150,7 @@ impl ExecutionClient for BybitExecutionClient {
         let position_reports_fut = async {
             let product_types = self.product_types();
             let skip_spot = product_types.iter().any(|product_type| {
-                !Self::provides_bulk_position_coverage_for_product_type(*product_type)
+                !provides_bulk_position_coverage_for_product_type(*product_type)
             });
 
             if skip_spot {
@@ -1231,7 +1159,8 @@ impl ExecutionClient for BybitExecutionClient {
                 );
             }
 
-            self.generate_bulk_position_status_reports(product_types)
+            self.report_client()
+                .collect_bulk_position_status_reports(&product_types)
                 .await
         };
 
@@ -2314,32 +2243,226 @@ fn classify_http_failure(error: &anyhow::Error) -> CommandFailure {
 
 impl BybitExecutionClient {
     fn cache_reconciliation_order_identity(&self, report: &OrderStatusReport) {
-        let Some(client_order_id) = report.client_order_id else {
-            return;
+        cache_reconciliation_order_identity(&self.core, &self.dispatch_state, report);
+    }
+}
+
+// Runs on the core thread: the order identity depends on the current cache state
+fn cache_reconciliation_order_identity(
+    core: &ExecutionClientCore,
+    dispatch_state: &WsDispatchState,
+    report: &OrderStatusReport,
+) {
+    let Some(client_order_id) = report.client_order_id else {
+        return;
+    };
+
+    if report.order_status.is_closed() {
+        dispatch_state.order_identities.remove(&client_order_id);
+        return;
+    }
+
+    let cache = core.cache();
+    let Some(order) = cache.order(&client_order_id) else {
+        return;
+    };
+
+    let identity = OrderIdentity {
+        instrument_id: report.instrument_id,
+        strategy_id: order.strategy_id(),
+        order_side: order.order_side(),
+        order_type: order.order_type(),
+        venue_position_id: report.venue_position_id,
+    };
+    dispatch_state
+        .order_identities
+        .insert(client_order_id, identity);
+}
+
+fn product_type_for_instrument(instrument_id: InstrumentId) -> BybitProductType {
+    BybitProductType::from_suffix(instrument_id.symbol.as_str()).unwrap_or_else(|| {
+        log::warn!("No product-type suffix on {instrument_id}, defaulting to Linear");
+        BybitProductType::Linear
+    })
+}
+
+const fn provides_bulk_position_coverage_for_product_type(product_type: BybitProductType) -> bool {
+    !matches!(product_type, BybitProductType::Spot)
+}
+
+/// Owned HTTP report collection that runs off the core thread without cache access.
+struct BybitReportClient {
+    account_id: AccountId,
+    http_client: BybitHttpClient,
+    product_types: Vec<BybitProductType>,
+}
+
+impl BybitReportClient {
+    async fn collect_order_status_report(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let Some(instrument_id) = cmd.instrument_id else {
+            log::warn!("generate_order_status_report requires instrument_id: {cmd}");
+            return Ok(None);
         };
 
-        if report.order_status.is_closed() {
-            self.dispatch_state
-                .order_identities
-                .remove(&client_order_id);
-            return;
+        let product_type = product_type_for_instrument(instrument_id);
+
+        let mut reports = self
+            .http_client
+            .request_order_status_reports(
+                self.account_id,
+                product_type,
+                Some(instrument_id),
+                false,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        if let Some(client_order_id) = cmd.client_order_id {
+            reports.retain(|report| report.client_order_id == Some(client_order_id));
         }
 
-        let cache = self.core.cache();
-        let Some(order) = cache.order(&client_order_id) else {
-            return;
-        };
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
+        }
 
-        let identity = OrderIdentity {
-            instrument_id: report.instrument_id,
-            strategy_id: order.strategy_id(),
-            order_side: order.order_side(),
-            order_type: order.order_type(),
-            venue_position_id: report.venue_position_id,
-        };
-        self.dispatch_state
-            .order_identities
-            .insert(client_order_id, identity);
+        Ok(reports.into_iter().next())
+    }
+
+    async fn collect_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let mut reports = Vec::new();
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            let product_type = product_type_for_instrument(instrument_id);
+            let mut fetched = self
+                .http_client
+                .request_order_status_reports(
+                    self.account_id,
+                    product_type,
+                    Some(instrument_id),
+                    cmd.open_only,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            reports.append(&mut fetched);
+        } else {
+            for product_type in &self.product_types {
+                let mut fetched = self
+                    .http_client
+                    .request_order_status_reports(
+                        self.account_id,
+                        *product_type,
+                        None,
+                        cmd.open_only,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                reports.append(&mut fetched);
+            }
+        }
+
+        if let Some(start) = cmd.start {
+            reports.retain(|r| r.ts_last >= start);
+        }
+
+        if let Some(end) = cmd.end {
+            reports.retain(|r| r.ts_last <= end);
+        }
+
+        Ok(reports)
+    }
+
+    async fn collect_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let start_ms = nanos_to_millis(cmd.start);
+        let end_ms = nanos_to_millis(cmd.end);
+        let mut reports = Vec::new();
+
+        if let Some(instrument_id) = cmd.instrument_id {
+            let product_type = product_type_for_instrument(instrument_id);
+            let mut fetched = self
+                .http_client
+                .request_fill_reports(
+                    self.account_id,
+                    product_type,
+                    Some(instrument_id),
+                    start_ms,
+                    end_ms,
+                    None,
+                )
+                .await?;
+            reports.append(&mut fetched);
+        } else {
+            for product_type in &self.product_types {
+                let mut fetched = self
+                    .http_client
+                    .request_fill_reports(
+                        self.account_id,
+                        *product_type,
+                        None,
+                        start_ms,
+                        end_ms,
+                        None,
+                    )
+                    .await?;
+                reports.append(&mut fetched);
+            }
+        }
+
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|report| report.venue_order_id.as_str() == venue_order_id.as_str());
+        }
+
+        Ok(reports)
+    }
+
+    async fn collect_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        if let Some(instrument_id) = cmd.instrument_id {
+            let product_type = product_type_for_instrument(instrument_id);
+            self.http_client
+                .request_position_status_reports(self.account_id, product_type, Some(instrument_id))
+                .await
+        } else {
+            self.collect_bulk_position_status_reports(&self.product_types)
+                .await
+        }
+    }
+
+    async fn collect_bulk_position_status_reports(
+        &self,
+        product_types: &[BybitProductType],
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let mut reports = Vec::new();
+
+        for product_type in product_types {
+            if !provides_bulk_position_coverage_for_product_type(*product_type) {
+                continue;
+            }
+
+            let mut fetched = self
+                .http_client
+                .request_position_status_reports(self.account_id, *product_type, None)
+                .await?;
+            reports.append(&mut fetched);
+        }
+
+        Ok(reports)
     }
 }
 

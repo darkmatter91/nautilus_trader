@@ -52,7 +52,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt, pin_mut};
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -799,6 +799,17 @@ impl DydxExecutionClient {
         let count = self.instrument_cache.len();
         self.core.set_instruments_initialized();
         log::debug!("Instruments initialized: {count} instruments in shared cache");
+    }
+
+    fn report_client(&self) -> DydxReportClient {
+        DydxReportClient {
+            http_client: self.http_client.clone(),
+            instrument_cache: Arc::clone(&self.instrument_cache),
+            encoder: Arc::clone(&self.encoder),
+            account_id: self.core.account_id,
+            wallet_address: self.wallet_address.clone(),
+            subaccount_number: self.subaccount_number,
+        }
     }
 
     fn get_instrument_by_market(&self, market: &str) -> Option<InstrumentAny> {
@@ -2468,163 +2479,74 @@ impl ExecutionClient for DydxExecutionClient {
         Ok(())
     }
 
+    fn generate_order_status_report_task(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_report(&command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        let client = self.report_client();
+        let core = self.core.clone();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_reports(&command).await },
+            move |mut reports| {
+                retain_reports_not_closed_in_cache(&core, &mut reports);
+                Ok(reports)
+            },
+        ))
+    }
+
+    fn generate_fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_fill_reports(command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_position_status_reports_task(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_position_status_reports(&command).await },
+            Ok,
+        ))
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        // dYdX Indexer `/v4/orders` caps at `limit` and has no offset cursor, so we
-        // request the maximum page to maximize the chance of finding a match
-        // on active subaccounts. Callers looking for older orders should prefer
-        // `generate_mass_status` or narrow via `instrument_id`.
-        let market = cmd
-            .instrument_id
-            .map(|id| id.symbol.as_str().trim_end_matches("-PERP").to_string());
-
-        let response = self
-            .http_client
-            .inner
-            .get_orders(
-                &self.wallet_address,
-                self.subaccount_number,
-                market.as_deref(),
-                Some(DYDX_INDEXER_REPORT_LIMIT),
-            )
-            .await
-            .context("failed to fetch order from dYdX API")?;
-
-        if response.is_empty() {
-            log::debug!(
-                "No orders returned for {}/subaccount={} (market_filter={:?})",
-                self.wallet_address,
-                self.subaccount_number,
-                market,
-            );
-            return Ok(None);
-        }
-
-        let ts_init = UnixNanos::default();
-        let scanned_count = response.len();
-
-        let report = find_matching_order_report(
-            &response,
-            cmd.instrument_id,
-            cmd.client_order_id,
-            cmd.venue_order_id,
-            |clob_pair_id| self.get_instrument_by_clob_pair_id(clob_pair_id),
-            &self.encoder,
-            self.core.account_id,
-            ts_init,
-        )?;
-
-        if report.is_none() {
-            // The target order was not in the fetched page. Surface the scope so
-            // callers can tell whether the order is older than the page or the
-            // filters simply didn't match any returned order.
-            let page_full = scanned_count == DYDX_INDEXER_REPORT_LIMIT as usize;
-            log::debug!(
-                "No order matched filters for {}/subaccount={} \
-                 (client_order_id={:?}, venue_order_id={:?}, instrument_id={:?}, \
-                 scanned={scanned_count}, page_full={page_full}, limit={DYDX_INDEXER_REPORT_LIMIT})",
-                self.wallet_address,
-                self.subaccount_number,
-                cmd.client_order_id,
-                cmd.venue_order_id,
-                cmd.instrument_id,
-            );
-        }
-
-        Ok(report)
+        self.report_client().collect_order_status_report(cmd).await
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let response = self
-            .http_client
-            .inner
-            .get_orders(
-                &self.wallet_address,
-                self.subaccount_number,
-                None, // market filter
-                Some(DYDX_INDEXER_REPORT_LIMIT),
-            )
-            .await
-            .context("failed to fetch orders from dYdX API")?;
-
-        let mut reports = Vec::new();
-        let ts_init = UnixNanos::default();
-
-        for order in response {
-            let instrument = match self.get_instrument_by_clob_pair_id(order.clob_pair_id) {
-                Some(inst) => inst,
-                None => continue,
-            };
-
-            if let Some(filter_id) = cmd.instrument_id
-                && instrument.id() != filter_id
-            {
-                continue;
-            }
-
-            match parse_order_status_report(&order, &instrument, self.core.account_id, ts_init) {
-                Ok(mut r) => {
-                    if !order.client_id.is_empty()
-                        && let Ok(client_id_u32) = order.client_id.parse::<u32>()
-                    {
-                        self.encoder.register_known_client_id(client_id_u32);
-
-                        if let Some(decoded) = self
-                            .encoder
-                            .decode_if_known(client_id_u32, order.client_metadata)
-                        {
-                            log::debug!(
-                                "Decoded order: dYdX client_id={} meta={:#x} -> '{}'",
-                                client_id_u32,
-                                order.client_metadata,
-                                decoded,
-                            );
-                            r.client_order_id = Some(decoded);
-                        }
-                    }
-                    reports.push(r);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse order status report: {e}");
-                }
-            }
-        }
-
-        retain_order_status_reports(&mut reports, cmd);
-
-        // Drop reports that conflict with the local cache: if we already have
-        // the order in a terminal status (FILLED/CANCELED/EXPIRED/REJECTED/DENIED),
-        // replaying an `Accepted` from open-check would error in the ExecEngine.
-        // The venue may legitimately still consider the order open due to clock
-        // skew between our inferred fill and the next venue update; skipping
-        // here keeps the engine quiet while reconciliation eventually catches up.
-        {
-            let cache = self.core.cache();
-            reports.retain(|r| {
-                let Some(cid) = r.client_order_id else {
-                    return true;
-                };
-
-                match cache.order(&cid) {
-                    Some(order) if order.status().is_closed() => {
-                        log::debug!(
-                            "Skipping reconciliation report for terminal order {cid} \
-                             (cache status={:?}, venue status={:?})",
-                            order.status(),
-                            r.order_status,
-                        );
-                        false
-                    }
-                    _ => true,
-                }
-            });
-        }
-
+        let mut reports = self
+            .report_client()
+            .collect_order_status_reports(cmd)
+            .await?;
+        retain_reports_not_closed_in_cache(&self.core, &mut reports);
         Ok(reports)
     }
 
@@ -2632,101 +2554,16 @@ impl ExecutionClient for DydxExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let response = self
-            .http_client
-            .inner
-            .get_fills(
-                &self.wallet_address,
-                self.subaccount_number,
-                None, // market filter
-                Some(DYDX_INDEXER_REPORT_LIMIT),
-            )
-            .await
-            .context("failed to fetch fills from dYdX API")?;
-
-        let mut reports = Vec::new();
-        let ts_init = UnixNanos::default();
-
-        for fill in response.fills {
-            let instrument = match self.get_instrument_by_market(&fill.market) {
-                Some(inst) => inst,
-                None => {
-                    log::warn!("Unknown market in fill: {}", fill.market);
-                    continue;
-                }
-            };
-
-            if let Some(filter_id) = cmd.instrument_id
-                && instrument.id() != filter_id
-            {
-                continue;
-            }
-
-            let report = match parse_fill_report(&fill, &instrument, self.core.account_id, ts_init)
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("Failed to parse fill report: {e}");
-                    continue;
-                }
-            };
-
-            reports.push(report);
-        }
-
-        if let Some(venue_order_id) = cmd.venue_order_id {
-            reports.retain(|r| r.venue_order_id.as_str() == venue_order_id.as_str());
-        }
-
-        Ok(reports)
+        self.report_client().collect_fill_reports(cmd).await
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        let response = self
-            .http_client
-            .inner
-            .get_subaccount(&self.wallet_address, self.subaccount_number)
+        self.report_client()
+            .collect_position_status_reports(cmd)
             .await
-            .context("failed to fetch subaccount from dYdX API")?;
-
-        let mut reports = Vec::new();
-        let ts_init = UnixNanos::default();
-
-        for (market_ticker, perp_position) in &response.subaccount.open_perpetual_positions {
-            let instrument = match self.get_instrument_by_market(market_ticker) {
-                Some(inst) => inst,
-                None => {
-                    log::warn!("Unknown market in position: {market_ticker}");
-                    continue;
-                }
-            };
-
-            if let Some(filter_id) = cmd.instrument_id
-                && instrument.id() != filter_id
-            {
-                continue;
-            }
-
-            let report = match parse_position_status_report(
-                perp_position,
-                &instrument,
-                self.core.account_id,
-                ts_init,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("Failed to parse position status report: {e}");
-                    continue;
-                }
-            };
-
-            reports.push(report);
-        }
-
-        Ok(reports)
     }
 
     async fn generate_mass_status(
@@ -2857,27 +2694,7 @@ impl ExecutionClient for DydxExecutionClient {
         // `generate_order_status_reports`. On a cold start the cache is empty so
         // this is a no-op; on a hot reconciliation pass it prevents replaying
         // `Accepted` events for orders the engine already considers terminal.
-        {
-            let cache = self.core.cache();
-            order_reports.retain(|r| {
-                let Some(cid) = r.client_order_id else {
-                    return true;
-                };
-
-                match cache.order(&cid) {
-                    Some(order) if order.status().is_closed() => {
-                        log::debug!(
-                            "Skipping reconciliation report for terminal order {cid} \
-                             (cache status={:?}, venue status={:?})",
-                            order.status(),
-                            r.order_status,
-                        );
-                        false
-                    }
-                    _ => true,
-                }
-            });
-        }
+        retain_reports_not_closed_in_cache(&self.core, &mut order_reports);
 
         if let Some(mins) = lookback_mins {
             let now_ns = self.clock.get_time_ns();
@@ -2927,6 +2744,300 @@ impl ExecutionClient for DydxExecutionClient {
 
         Ok(Some(mass_status))
     }
+}
+
+/// Owned report collection for worker tasks and the inline report methods.
+///
+/// Holds no live cache or `Rc` state, so collection can run on a runtime worker. Cache-dependent
+/// filtering runs afterwards on the core thread.
+#[derive(Debug, Clone)]
+struct DydxReportClient {
+    http_client: DydxHttpClient,
+    instrument_cache: Arc<InstrumentCache>,
+    encoder: Arc<ClientOrderIdEncoder>,
+    account_id: AccountId,
+    wallet_address: String,
+    subaccount_number: u32,
+}
+
+impl DydxReportClient {
+    fn get_instrument_by_market(&self, market: &str) -> Option<InstrumentAny> {
+        self.instrument_cache.get_by_market(market)
+    }
+
+    fn get_instrument_by_clob_pair_id(&self, clob_pair_id: u32) -> Option<InstrumentAny> {
+        let instrument = self.instrument_cache.get_by_clob_id(clob_pair_id);
+
+        if instrument.is_none() {
+            self.instrument_cache.log_missing_clob_pair_id(clob_pair_id);
+        }
+
+        instrument
+    }
+
+    async fn collect_order_status_report(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        // dYdX Indexer `/v4/orders` caps at `limit` and has no offset cursor, so we
+        // request the maximum page to maximize the chance of finding a match
+        // on active subaccounts. Callers looking for older orders should prefer
+        // `generate_mass_status` or narrow via `instrument_id`.
+        let market = cmd
+            .instrument_id
+            .map(|id| id.symbol.as_str().trim_end_matches("-PERP").to_string());
+
+        let response = self
+            .http_client
+            .inner
+            .get_orders(
+                &self.wallet_address,
+                self.subaccount_number,
+                market.as_deref(),
+                Some(DYDX_INDEXER_REPORT_LIMIT),
+            )
+            .await
+            .context("failed to fetch order from dYdX API")?;
+
+        if response.is_empty() {
+            log::debug!(
+                "No orders returned for {}/subaccount={} (market_filter={:?})",
+                self.wallet_address,
+                self.subaccount_number,
+                market,
+            );
+            return Ok(None);
+        }
+
+        let ts_init = UnixNanos::default();
+        let scanned_count = response.len();
+
+        let report = find_matching_order_report(
+            &response,
+            cmd.instrument_id,
+            cmd.client_order_id,
+            cmd.venue_order_id,
+            |clob_pair_id| self.get_instrument_by_clob_pair_id(clob_pair_id),
+            &self.encoder,
+            self.account_id,
+            ts_init,
+        )?;
+
+        if report.is_none() {
+            // The target order was not in the fetched page. Surface the scope so
+            // callers can tell whether the order is older than the page or the
+            // filters simply didn't match any returned order.
+            let page_full = scanned_count == DYDX_INDEXER_REPORT_LIMIT as usize;
+            log::debug!(
+                "No order matched filters for {}/subaccount={} \
+                 (client_order_id={:?}, venue_order_id={:?}, instrument_id={:?}, \
+                 scanned={scanned_count}, page_full={page_full}, limit={DYDX_INDEXER_REPORT_LIMIT})",
+                self.wallet_address,
+                self.subaccount_number,
+                cmd.client_order_id,
+                cmd.venue_order_id,
+                cmd.instrument_id,
+            );
+        }
+
+        Ok(report)
+    }
+
+    async fn collect_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let response = self
+            .http_client
+            .inner
+            .get_orders(
+                &self.wallet_address,
+                self.subaccount_number,
+                None, // market filter
+                Some(DYDX_INDEXER_REPORT_LIMIT),
+            )
+            .await
+            .context("failed to fetch orders from dYdX API")?;
+
+        let mut reports = Vec::new();
+        let ts_init = UnixNanos::default();
+
+        for order in response {
+            let instrument = match self.get_instrument_by_clob_pair_id(order.clob_pair_id) {
+                Some(inst) => inst,
+                None => continue,
+            };
+
+            if let Some(filter_id) = cmd.instrument_id
+                && instrument.id() != filter_id
+            {
+                continue;
+            }
+
+            match parse_order_status_report(&order, &instrument, self.account_id, ts_init) {
+                Ok(mut r) => {
+                    if !order.client_id.is_empty()
+                        && let Ok(client_id_u32) = order.client_id.parse::<u32>()
+                    {
+                        self.encoder.register_known_client_id(client_id_u32);
+
+                        if let Some(decoded) = self
+                            .encoder
+                            .decode_if_known(client_id_u32, order.client_metadata)
+                        {
+                            log::debug!(
+                                "Decoded order: dYdX client_id={} meta={:#x} -> '{}'",
+                                client_id_u32,
+                                order.client_metadata,
+                                decoded,
+                            );
+                            r.client_order_id = Some(decoded);
+                        }
+                    }
+                    reports.push(r);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse order status report: {e}");
+                }
+            }
+        }
+
+        retain_order_status_reports(&mut reports, cmd);
+
+        Ok(reports)
+    }
+
+    async fn collect_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let response = self
+            .http_client
+            .inner
+            .get_fills(
+                &self.wallet_address,
+                self.subaccount_number,
+                None, // market filter
+                Some(DYDX_INDEXER_REPORT_LIMIT),
+            )
+            .await
+            .context("failed to fetch fills from dYdX API")?;
+
+        let mut reports = Vec::new();
+        let ts_init = UnixNanos::default();
+
+        for fill in response.fills {
+            let instrument = match self.get_instrument_by_market(&fill.market) {
+                Some(inst) => inst,
+                None => {
+                    log::warn!("Unknown market in fill: {}", fill.market);
+                    continue;
+                }
+            };
+
+            if let Some(filter_id) = cmd.instrument_id
+                && instrument.id() != filter_id
+            {
+                continue;
+            }
+
+            let report = match parse_fill_report(&fill, &instrument, self.account_id, ts_init) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("Failed to parse fill report: {e}");
+                    continue;
+                }
+            };
+
+            reports.push(report);
+        }
+
+        if let Some(venue_order_id) = cmd.venue_order_id {
+            reports.retain(|r| r.venue_order_id.as_str() == venue_order_id.as_str());
+        }
+
+        Ok(reports)
+    }
+
+    async fn collect_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let response = self
+            .http_client
+            .inner
+            .get_subaccount(&self.wallet_address, self.subaccount_number)
+            .await
+            .context("failed to fetch subaccount from dYdX API")?;
+
+        let mut reports = Vec::new();
+        let ts_init = UnixNanos::default();
+
+        for (market_ticker, perp_position) in &response.subaccount.open_perpetual_positions {
+            let instrument = match self.get_instrument_by_market(market_ticker) {
+                Some(inst) => inst,
+                None => {
+                    log::warn!("Unknown market in position: {market_ticker}");
+                    continue;
+                }
+            };
+
+            if let Some(filter_id) = cmd.instrument_id
+                && instrument.id() != filter_id
+            {
+                continue;
+            }
+
+            let report = match parse_position_status_report(
+                perp_position,
+                &instrument,
+                self.account_id,
+                ts_init,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("Failed to parse position status report: {e}");
+                    continue;
+                }
+            };
+
+            reports.push(report);
+        }
+
+        Ok(reports)
+    }
+}
+
+/// Drops reports that conflict with the local cache on the core thread.
+///
+/// If the cache already holds the order in a terminal status (FILLED/CANCELED/EXPIRED/REJECTED/
+/// DENIED), replaying an `Accepted` from an open check would error in the ExecEngine. The venue
+/// may legitimately still consider the order open due to clock skew between our inferred fill
+/// and the next venue update; skipping here keeps the engine quiet while reconciliation
+/// eventually catches up.
+fn retain_reports_not_closed_in_cache(
+    core: &ExecutionClientCore,
+    reports: &mut Vec<OrderStatusReport>,
+) {
+    let cache = core.cache();
+    reports.retain(|r| {
+        let Some(cid) = r.client_order_id else {
+            return true;
+        };
+
+        match cache.order(&cid) {
+            Some(order) if order.status().is_closed() => {
+                log::debug!(
+                    "Skipping reconciliation report for terminal order {cid} \
+                     (cache status={:?}, venue status={:?})",
+                    order.status(),
+                    r.order_status,
+                );
+                false
+            }
+            _ => true,
+        }
+    });
 }
 
 type CancelAllOrderData = (
@@ -3050,6 +3161,7 @@ mod tests {
     };
     use nautilus_model::{
         enums::OrderSide,
+        events::OrderDenied,
         identifiers::{Symbol, TraderId},
         instruments::{CryptoPerpetual, InstrumentAny},
         orders::{Order as _, OrderAny},
@@ -3058,6 +3170,7 @@ mod tests {
     use rstest::rstest;
     use rust_decimal_macros::dec;
     use serde_json::Value;
+    use ustr::Ustr;
 
     use super::*;
     use crate::{
@@ -3808,5 +3921,454 @@ mod tests {
         .expect("matching order should be found");
 
         assert_eq!(report.venue_order_id.as_str(), "order-btc");
+    }
+
+    #[derive(Clone, Default)]
+    struct ReportServerState {
+        fail: Arc<std::sync::atomic::AtomicBool>,
+        orders: Arc<Mutex<Option<Value>>>,
+    }
+
+    fn report_fixture(fixture: &str) -> Value {
+        let value: Value = serde_json::from_str(fixture).unwrap();
+        value["result"].clone()
+    }
+
+    async fn start_report_server(state: ReportServerState) -> std::net::SocketAddr {
+        let router = Router::new().fallback(get(move |uri: Uri| {
+            let state = state.clone();
+            async move {
+                if state.fail.load(Ordering::Acquire) {
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"errors": [{"msg": "boom"}]})),
+                    );
+                }
+
+                let value = if uri.path() == "/v4/orders" {
+                    state.orders.lock().clone().unwrap_or_else(|| {
+                        report_fixture(include_str!("../../test_data/http_get_orders.json"))
+                    })
+                } else if uri.path() == "/v4/fills" {
+                    report_fixture(include_str!("../../test_data/http_get_fills.json"))
+                } else {
+                    let mut value =
+                        report_fixture(include_str!("../../test_data/http_get_subaccount.json"));
+                    value["subaccount"]["openPerpetualPositions"] = serde_json::json!({
+                        "BTC-USD": {
+                            "market": "BTC-USD",
+                            "status": "OPEN",
+                            "side": "LONG",
+                            "size": "0.5",
+                            "maxSize": "1.0",
+                            "entryPrice": "43000.0",
+                            "exitPrice": null,
+                            "realizedPnl": "125.50",
+                            "unrealizedPnl": "125.00",
+                            "createdAtHeight": "63049869",
+                            "createdAt": "2024-01-01T00:00:00.000Z",
+                            "closedAt": null,
+                            "sumOpen": "0.5",
+                            "sumClose": "0.0",
+                            "netFunding": "-10.25"
+                        }
+                    });
+                    value
+                };
+
+                (axum::http::StatusCode::OK, Json(value))
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        addr
+    }
+
+    fn create_report_execution_client(
+        addr: std::net::SocketAddr,
+    ) -> (
+        DydxExecutionClient,
+        Rc<RefCell<Cache>>,
+        tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    ) {
+        let (mut client, cache, rx) = create_execution_client();
+        client.http_client = DydxHttpClient::new(
+            Some(format!("http://{addr}")),
+            5,
+            None,
+            client.config.network,
+            Some(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        let markets = report_fixture(include_str!(
+            "../../test_data/http_get_perpetual_markets.json"
+        ));
+        let market: crate::http::models::PerpetualMarket =
+            serde_json::from_value(markets["markets"]["BTC-USD"].clone()).unwrap();
+        let instrument =
+            crate::http::parse::parse_instrument_any(&market, UnixNanos::default()).unwrap();
+        client.instrument_cache.insert(instrument, market);
+
+        (client, cache, rx)
+    }
+
+    fn btc_perp_id() -> InstrumentId {
+        InstrumentId::from("BTC-USD-PERP.DYDX")
+    }
+
+    fn order_report_cmd(venue_order_id: &str) -> GenerateOrderStatusReport {
+        GenerateOrderStatusReport::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(btc_perp_id()),
+            None,
+            Some(VenueOrderId::from(venue_order_id)),
+            None,
+            None,
+        )
+    }
+
+    fn order_reports_cmd(open_only: bool) -> GenerateOrderStatusReports {
+        GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            open_only,
+            Some(btc_perp_id()),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn fill_reports_cmd(venue_order_id: Option<&str>) -> GenerateFillReports {
+        GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(btc_perp_id()),
+            venue_order_id.map(VenueOrderId::from),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn position_reports_cmd() -> GeneratePositionStatusReports {
+        GeneratePositionStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(btc_perp_id()),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Runs collection on a runtime worker while the live cache is mutably borrowed, so any
+    /// cache access during collection panics, then finishes on the calling thread.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "worker report collection must not access the borrowed live cache"
+    )]
+    async fn run_report_task<T>(
+        task: ExecutionReportTask<T>,
+        cache: &Rc<RefCell<Cache>>,
+    ) -> anyhow::Result<T> {
+        let core_thread = std::thread::current().id();
+        let cache_borrow = cache.borrow_mut();
+        tokio::spawn(async move {
+            assert_ne!(std::thread::current().id(), core_thread);
+            task.collection.await;
+        })
+        .await
+        .unwrap();
+        drop(cache_borrow);
+
+        task.result.await
+    }
+
+    fn assert_same_reports<T: serde::Serialize>(inline: &[T], worker: &[T]) {
+        let strip = |reports: &[T]| {
+            reports
+                .iter()
+                .map(|report| {
+                    let mut value = serde_json::to_value(report).unwrap();
+                    value.as_object_mut().unwrap().remove("report_id");
+                    value
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(worker), strip(inline));
+    }
+
+    fn closed_cached_order(cache: &Rc<RefCell<Cache>>, client_order_id: ClientOrderId) {
+        let mut factory = test_order_factory();
+        let mut order = factory.limit(
+            btc_perp_id(),
+            OrderSide::Buy,
+            Quantity::from("0.0001"),
+            Price::from("110372"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(client_order_id),
+        );
+        order
+            .apply(OrderEventAny::Denied(OrderDenied::new(
+                order.trader_id(),
+                order.strategy_id(),
+                order.instrument_id(),
+                client_order_id,
+                Ustr::from("test"),
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+            )))
+            .unwrap();
+        assert!(order.status().is_closed());
+        cache_order(cache, order);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_report_tasks_match_inline_reports() {
+        let addr = start_report_server(ReportServerState::default()).await;
+        let (client, cache, _rx) = create_report_execution_client(addr);
+
+        let single = order_report_cmd("8e2be4a2-86c6-5a32-a081-b223778c3e33");
+        let orders = order_reports_cmd(false);
+        let fills = fill_reports_cmd(Some("47077318-e213-572f-9af1-c17b3fe1a784"));
+        let positions = position_reports_cmd();
+
+        let inline_single = client
+            .generate_order_status_report(&single)
+            .await
+            .unwrap()
+            .unwrap();
+        let inline_orders = client.generate_order_status_reports(&orders).await.unwrap();
+        let inline_fills = client.generate_fill_reports(fills.clone()).await.unwrap();
+        let inline_positions = client
+            .generate_position_status_reports(&positions)
+            .await
+            .unwrap();
+
+        let worker_single = run_report_task(
+            client.generate_order_status_report_task(&single).unwrap(),
+            &cache,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let worker_orders = run_report_task(
+            client.generate_order_status_reports_task(&orders).unwrap(),
+            &cache,
+        )
+        .await
+        .unwrap();
+        let worker_fills =
+            run_report_task(client.generate_fill_reports_task(&fills).unwrap(), &cache)
+                .await
+                .unwrap();
+        let worker_positions = run_report_task(
+            client
+                .generate_position_status_reports_task(&positions)
+                .unwrap(),
+            &cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            inline_single.venue_order_id,
+            VenueOrderId::from("8e2be4a2-86c6-5a32-a081-b223778c3e33")
+        );
+        assert_eq!(inline_orders.len(), 3);
+        assert_eq!(inline_fills.len(), 1);
+        assert_eq!(inline_positions.len(), 1);
+        assert_same_reports(&[inline_single], &[worker_single]);
+        assert_same_reports(&inline_orders, &worker_orders);
+        assert_same_reports(&inline_fills, &worker_fills);
+        assert_same_reports(&inline_positions, &worker_positions);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_report_tasks_honor_filters(#[values(false, true)] worker: bool) {
+        let addr = start_report_server(ReportServerState::default()).await;
+        let (client, cache, _rx) = create_report_execution_client(addr);
+
+        let missing = order_report_cmd("not-an-order");
+        let open_only = order_reports_cmd(true);
+        let unmatched_fills = fill_reports_cmd(Some("not-an-order"));
+
+        let (single, orders, fills) = if worker {
+            (
+                run_report_task(
+                    client.generate_order_status_report_task(&missing).unwrap(),
+                    &cache,
+                )
+                .await
+                .unwrap(),
+                run_report_task(
+                    client
+                        .generate_order_status_reports_task(&open_only)
+                        .unwrap(),
+                    &cache,
+                )
+                .await
+                .unwrap(),
+                run_report_task(
+                    client.generate_fill_reports_task(&unmatched_fills).unwrap(),
+                    &cache,
+                )
+                .await
+                .unwrap(),
+            )
+        } else {
+            (
+                client.generate_order_status_report(&missing).await.unwrap(),
+                client
+                    .generate_order_status_reports(&open_only)
+                    .await
+                    .unwrap(),
+                client.generate_fill_reports(unmatched_fills).await.unwrap(),
+            )
+        };
+
+        // All fixture orders are filled, so `open_only` keeps none of them
+        assert!(single.is_none());
+        assert!(orders.is_empty());
+        assert!(fills.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_report_tasks_preserve_collection_errors() {
+        let state = ReportServerState::default();
+        state.fail.store(true, Ordering::Release);
+        let addr = start_report_server(state).await;
+        let (client, cache, _rx) = create_report_execution_client(addr);
+
+        let single = order_report_cmd("8e2be4a2-86c6-5a32-a081-b223778c3e33");
+        let orders = order_reports_cmd(false);
+        let fills = fill_reports_cmd(None);
+        let positions = position_reports_cmd();
+
+        let cases = [
+            (
+                "failed to fetch order from dYdX API",
+                client
+                    .generate_order_status_report(&single)
+                    .await
+                    .unwrap_err(),
+                run_report_task(
+                    client.generate_order_status_report_task(&single).unwrap(),
+                    &cache,
+                )
+                .await
+                .unwrap_err(),
+            ),
+            (
+                "failed to fetch orders from dYdX API",
+                client
+                    .generate_order_status_reports(&orders)
+                    .await
+                    .unwrap_err(),
+                run_report_task(
+                    client.generate_order_status_reports_task(&orders).unwrap(),
+                    &cache,
+                )
+                .await
+                .unwrap_err(),
+            ),
+            (
+                "failed to fetch fills from dYdX API",
+                client
+                    .generate_fill_reports(fills.clone())
+                    .await
+                    .unwrap_err(),
+                run_report_task(client.generate_fill_reports_task(&fills).unwrap(), &cache)
+                    .await
+                    .unwrap_err(),
+            ),
+            (
+                "failed to fetch subaccount from dYdX API",
+                client
+                    .generate_position_status_reports(&positions)
+                    .await
+                    .unwrap_err(),
+                run_report_task(
+                    client
+                        .generate_position_status_reports_task(&positions)
+                        .unwrap(),
+                    &cache,
+                )
+                .await
+                .unwrap_err(),
+            ),
+        ];
+
+        for (context, inline, worker) in cases {
+            assert_eq!(inline.to_string(), context);
+            assert_eq!(format!("{worker:#}"), format!("{inline:#}"));
+        }
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_order_reports_task_filters_terminal_orders_on_core() {
+        let state = ReportServerState::default();
+        let addr = start_report_server(state.clone()).await;
+        let (client, cache, _rx) = create_report_execution_client(addr);
+
+        let client_order_id = ClientOrderId::from("O-REPORT-TERMINAL");
+        let encoded = client.encoder.encode(client_order_id).unwrap();
+        let mut orders = report_fixture(include_str!("../../test_data/http_get_orders.json"));
+        orders[0]["clientId"] = Value::from(encoded.client_id.to_string());
+        orders[0]["clientMetadata"] = Value::from(encoded.client_metadata.to_string());
+        *state.orders.lock() = Some(orders);
+
+        let cmd = order_reports_cmd(false);
+        let before = client.generate_order_status_reports(&cmd).await.unwrap();
+        assert!(
+            before
+                .iter()
+                .any(|report| report.client_order_id == Some(client_order_id))
+        );
+
+        // The order closes locally after the worker collects but before the core finishes
+        let task = client.generate_order_status_reports_task(&cmd).unwrap();
+        tokio::spawn(task.collection).await.unwrap();
+        closed_cached_order(&cache, client_order_id);
+        let worker = task.result.await.unwrap();
+        let inline = client.generate_order_status_reports(&cmd).await.unwrap();
+
+        assert_eq!(worker.len(), before.len() - 1);
+        assert!(
+            worker
+                .iter()
+                .all(|report| report.client_order_id != Some(client_order_id))
+        );
+        assert_same_reports(&inline, &worker);
     }
 }
