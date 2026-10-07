@@ -24,20 +24,21 @@ use nautilus_architect_ax::{
     common::{
         consts::{AX_CLIENT_ID, AX_VENUE},
         enums::AxEnvironment,
+        parse::client_order_id_to_cid,
     },
     config::AxExecutionClientConfig,
     execution::AxExecutionClient,
 };
 use nautilus_common::{
     cache::Cache,
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     live::runner::{replace_system_event_sender, set_exec_event_sender},
     messages::{
         ExecutionEvent, SystemEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
-            GenerateOrderStatusReports, GeneratePositionStatusReports, ModifyOrder, QueryAccount,
-            QueryOrder, SubmitOrder,
+            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
         },
         system::SocketState,
     },
@@ -53,6 +54,7 @@ use nautilus_model::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
     },
     orders::{LimitOrder, Order, OrderAny, builder::OrderTestBuilder},
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use rstest::rstest;
@@ -1012,7 +1014,9 @@ async fn set_uncached_mass_status_payload(state: &crate::common::server::TestSer
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_open_only_uses_open_orders() {
+async fn test_generate_order_status_reports_open_only_uses_open_orders(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, state) = start_test_server().await.unwrap();
     *state.open_orders_payload.lock().await = Some(serde_json::json!({
         "orders": [{
@@ -1057,7 +1061,7 @@ async fn test_generate_order_status_reports_open_only_uses_open_orders() {
         None,
         None,
     );
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
 
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].venue_order_id, VenueOrderId::from("OID-OPEN"));
@@ -1070,7 +1074,7 @@ async fn test_generate_order_status_reports_open_only_uses_open_orders() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_filters() {
+async fn test_generate_order_status_reports_filters(#[values(false, true)] worker: bool) {
     let (addr, state) = start_test_server().await.unwrap();
 
     // Replace default fixture with EURUSD + XAU orders across different states
@@ -1172,8 +1176,7 @@ async fn test_generate_order_status_reports_filters() {
         None,
         None,
     );
-    let reports = client
-        .generate_order_status_reports(&cmd)
+    let reports = generate_order_reports(&client, &cmd, worker)
         .await
         .expect("generate_order_status_reports");
     assert_eq!(reports.len(), 4);
@@ -1189,7 +1192,7 @@ async fn test_generate_order_status_reports_filters() {
         None,
         None,
     );
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].instrument_id, InstrumentId::from("XAU-PERP.AX"),);
 
@@ -1203,7 +1206,7 @@ async fn test_generate_order_status_reports_filters() {
         None,
         None,
     );
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
     assert_eq!(reports.len(), 3);
     assert!(
         reports
@@ -1233,7 +1236,7 @@ async fn test_generate_order_status_reports_filters() {
         None,
         None,
     );
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
     assert_eq!(reports.len(), 4);
     // OID-ACCEPTED predates the cutoff and is retained because it is not closed.
     assert!(
@@ -1254,7 +1257,7 @@ async fn test_generate_order_status_reports_filters() {
         None,
         None,
     );
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
     assert_eq!(reports.len(), 3);
     assert!(
         !reports
@@ -1268,7 +1271,9 @@ async fn test_generate_order_status_reports_filters() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_reads_all_partial_pages() {
+async fn test_generate_order_status_reports_reads_all_partial_pages(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, state) = start_test_server().await.unwrap();
     let orders = (0..101)
         .map(|index| {
@@ -1309,7 +1314,7 @@ async fn test_generate_order_status_reports_reads_all_partial_pages() {
         None,
         None,
     );
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
     let venue_order_ids = reports
         .iter()
         .map(|report| report.venue_order_id)
@@ -1326,7 +1331,9 @@ async fn test_generate_order_status_reports_reads_all_partial_pages() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_rejects_duplicate_order_ids() {
+async fn test_generate_order_status_reports_rejects_duplicate_order_ids(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, state) = start_test_server().await.unwrap();
     let order = serde_json::json!({
         "tn": 0,
@@ -1365,8 +1372,7 @@ async fn test_generate_order_status_reports_rejects_duplicate_order_ids() {
         None,
         None,
     );
-    let error = client
-        .generate_order_status_reports(&cmd)
+    let error = generate_order_reports(&client, &cmd, worker)
         .await
         .unwrap_err();
 
@@ -1381,7 +1387,9 @@ async fn test_generate_order_status_reports_rejects_duplicate_order_ids() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_rejects_repeated_cursor() {
+async fn test_generate_order_status_reports_rejects_repeated_cursor(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, state) = start_test_server().await.unwrap();
     *state.orders_payload.lock().await = Some(serde_json::json!({
         "orders": [
@@ -1409,8 +1417,7 @@ async fn test_generate_order_status_reports_rejects_repeated_cursor() {
         None,
         None,
     );
-    let error = client
-        .generate_order_status_reports(&cmd)
+    let error = generate_order_reports(&client, &cmd, worker)
         .await
         .unwrap_err();
 
@@ -1425,7 +1432,9 @@ async fn test_generate_order_status_reports_rejects_repeated_cursor() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_forwards_historical_bounds() {
+async fn test_generate_order_status_reports_forwards_historical_bounds(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, state) = start_test_server().await.unwrap();
     *state.orders_payload.lock().await = Some(serde_json::json!({ "orders": [] }));
 
@@ -1447,7 +1456,7 @@ async fn test_generate_order_status_reports_forwards_historical_bounds() {
         None,
         None,
     );
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = generate_order_reports(&client, &cmd, worker).await.unwrap();
     let queries = state.orders_queries.lock().await;
 
     assert!(reports.is_empty());
@@ -1457,6 +1466,429 @@ async fn test_generate_order_status_reports_forwards_historical_bounds() {
     assert_eq!(queries[0].limit, Some(100));
     assert_eq!(queries[0].cursor, None);
     drop(queries);
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+async fn run_report_task<T>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
+    let core_thread = std::thread::current().id();
+    nautilus_common::live::get_runtime()
+        .spawn(async move {
+            assert_ne!(std::thread::current().id(), core_thread);
+            task.collection.await;
+        })
+        .await
+        .unwrap();
+
+    task.result.await
+}
+
+async fn generate_order_report(
+    client: &AxExecutionClient,
+    cmd: &GenerateOrderStatusReport,
+    worker: bool,
+) -> anyhow::Result<Option<OrderStatusReport>> {
+    if worker {
+        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
+    } else {
+        client.generate_order_status_report(cmd).await
+    }
+}
+
+async fn generate_order_reports(
+    client: &AxExecutionClient,
+    cmd: &GenerateOrderStatusReports,
+    worker: bool,
+) -> anyhow::Result<Vec<OrderStatusReport>> {
+    if worker {
+        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
+    } else {
+        client.generate_order_status_reports(cmd).await
+    }
+}
+
+async fn generate_fills(
+    client: &AxExecutionClient,
+    cmd: GenerateFillReports,
+    worker: bool,
+) -> anyhow::Result<Vec<FillReport>> {
+    if worker {
+        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
+    } else {
+        client.generate_fill_reports(cmd).await
+    }
+}
+
+async fn generate_positions(
+    client: &AxExecutionClient,
+    cmd: &GeneratePositionStatusReports,
+    worker: bool,
+) -> anyhow::Result<Vec<PositionStatusReport>> {
+    if worker {
+        run_report_task(client.generate_position_status_reports_task(cmd).unwrap()).await
+    } else {
+        client.generate_position_status_reports(cmd).await
+    }
+}
+
+fn order_status_report_cmd(
+    instrument_id: Option<InstrumentId>,
+    client_order_id: Option<ClientOrderId>,
+    venue_order_id: Option<VenueOrderId>,
+) -> GenerateOrderStatusReport {
+    GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        None,
+        None,
+    )
+}
+
+fn create_open_order(oid: &str, symbol: &str, status: &str, cid: Option<u64>) -> serde_json::Value {
+    serde_json::json!({
+        "tn": 0,
+        "ts": 1_704_067_200,
+        "d": "B",
+        "o": status,
+        "oid": oid,
+        "p": "1.08400",
+        "q": 100,
+        "rq": 100,
+        "s": symbol,
+        "tif": "GTC",
+        "u": "u",
+        "xq": 0,
+        "cid": cid,
+        "tag": null
+    })
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_filters_open_orders(
+    #[values(false, true)] worker: bool,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.open_orders_payload.lock().await = Some(serde_json::json!({
+        "orders": [
+            create_open_order("OID-EUR", "EURUSD-PERP", "ACCEPTED", None),
+            create_open_order("OID-XAU", "XAU-PERP", "ACCEPTED", None),
+        ]
+    }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let cmd = order_status_report_cmd(None, None, Some(VenueOrderId::from("OID-XAU")));
+    let report = generate_order_report(&client, &cmd, worker)
+        .await
+        .unwrap()
+        .expect("report for OID-XAU");
+    assert_eq!(report.venue_order_id, VenueOrderId::from("OID-XAU"));
+    assert_eq!(report.instrument_id, InstrumentId::from("XAU-PERP.AX"));
+    assert_eq!(report.order_status, OrderStatus::Accepted);
+
+    let cmd = order_status_report_cmd(
+        Some(InstrumentId::from("EURUSD-PERP.AX")),
+        None,
+        Some(VenueOrderId::from("OID-XAU")),
+    );
+    assert!(
+        generate_order_report(&client, &cmd, worker)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let cmd = order_status_report_cmd(None, Some(ClientOrderId::from("O-UNKNOWN")), None);
+    assert!(
+        generate_order_report(&client, &cmd, worker)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let cmd = order_status_report_cmd(None, None, Some(VenueOrderId::from("OID-MISSING")));
+    assert!(
+        generate_order_report(&client, &cmd, worker)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(state.open_orders_queries.lock().await.len(), 4);
+    assert_eq!(state.orders_queries.lock().await.len(), 0);
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_rejects_duplicate_order_ids(
+    #[values(false, true)] worker: bool,
+) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let order = create_open_order("OID-DUPLICATE", "EURUSD-PERP", "ACCEPTED", None);
+    *state.open_orders_payload.lock().await = Some(serde_json::json!({
+        "orders": [order.clone(), order],
+    }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let cmd = order_status_report_cmd(None, None, Some(VenueOrderId::from("OID-DUPLICATE")));
+    let error = generate_order_report(&client, &cmd, worker)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "AX open-orders pagination returned duplicate order ID OID-DUPLICATE"
+    );
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_position_status_reports_decode_error_matches_inline() {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.positions_payload.lock().await = Some(serde_json::json!({
+        "positions": [{ "symbol": "EURUSD-PERP" }]
+    }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let cmd = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let inline = generate_positions(&client, &cmd, false).await.unwrap_err();
+    let worker = generate_positions(&client, &cmd, true).await.unwrap_err();
+
+    assert_eq!(format!("{worker:#}"), format!("{inline:#}"));
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_report_tasks_match_inline_reports() {
+    let (addr, state) = start_test_server().await.unwrap();
+    *state.open_orders_payload.lock().await = Some(serde_json::json!({
+        "orders": [create_open_order("OID-OPEN", "EURUSD-PERP", "ACCEPTED", Some(42))]
+    }));
+    *state.fills_payload.lock().await = Some(serde_json::json!({
+        "fills": [{
+            "trade_id": "T-1",
+            "order_id": "OID-OPEN",
+            "fee": "0.10",
+            "is_taker": true,
+            "is_block_trade": false,
+            "is_final_settlement": false,
+            "price": "1.08450",
+            "quantity": 100,
+            "side": "B",
+            "symbol": "EURUSD-PERP",
+            "timestamp": "2024-01-15T10:30:45Z",
+            "account_id": "u"
+        }]
+    }));
+    *state.positions_payload.lock().await = Some(serde_json::json!({
+        "positions": [{
+            "account_id": "u",
+            "symbol": "EURUSD-PERP",
+            "signed_quantity": 100,
+            "signed_notional": "108400.00",
+            "timestamp": "2024-01-15T10:30:45Z",
+            "realized_pnl": "0"
+        }]
+    }));
+
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let single = order_status_report_cmd(None, None, Some(VenueOrderId::from("OID-OPEN")));
+    let inline = generate_order_report(&client, &single, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut worker = generate_order_report(&client, &single, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(inline.client_order_id, Some(ClientOrderId::from("CID-42")));
+    assert_ne!(worker.report_id, inline.report_id);
+    worker.report_id = inline.report_id;
+    worker.ts_init = inline.ts_init;
+    assert_eq!(worker, inline);
+
+    let orders = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    let inline = generate_order_reports(&client, &orders, false)
+        .await
+        .unwrap();
+    let mut worker = generate_order_reports(&client, &orders, true)
+        .await
+        .unwrap();
+    assert_eq!(inline.len(), 1);
+    assert_eq!(worker.len(), 1);
+    worker[0].report_id = inline[0].report_id;
+    worker[0].ts_init = inline[0].ts_init;
+    assert_eq!(worker, inline);
+
+    let fills = GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        Some(VenueOrderId::from("OID-OPEN")),
+        None,
+        None,
+        None,
+        None,
+    );
+    let inline = generate_fills(&client, fills.clone(), false).await.unwrap();
+    let mut worker = generate_fills(&client, fills, true).await.unwrap();
+    assert_eq!(inline.len(), 1);
+    assert_eq!(worker.len(), 1);
+    worker[0].report_id = inline[0].report_id;
+    worker[0].ts_init = inline[0].ts_init;
+    assert_eq!(worker, inline);
+
+    let positions = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(InstrumentId::from("EURUSD-PERP.AX")),
+        None,
+        None,
+        None,
+        None,
+    );
+    let inline = generate_positions(&client, &positions, false)
+        .await
+        .unwrap();
+    let mut worker = generate_positions(&client, &positions, true).await.unwrap();
+    assert_eq!(inline.len(), 1);
+    assert_eq!(worker.len(), 1);
+    worker[0].report_id = inline[0].report_id;
+    worker[0].ts_init = inline[0].ts_init;
+    assert_eq!(worker, inline);
+
+    client.disconnect().await.expect("Failed to disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_order_status_report_task_cleans_closed_tracking_on_finish() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("AX-001"));
+    client.start().expect("Failed to start");
+    client.connect().await.expect("Failed to connect");
+    drain_rx(&mut rx);
+
+    let client_order_id = ClientOrderId::from("O-REPORT-CLOSED");
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("S-001"))
+        .instrument_id(InstrumentId::from("EURUSD-PERP.AX"))
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .price(Price::from("1.08400"))
+        .quantity(Quantity::from("100"))
+        .time_in_force(TimeInForce::Gtc)
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*AX_CLIENT_ID), false)
+        .unwrap();
+    client
+        .submit_order(make_submit_order_cmd(&order))
+        .expect("submit_order should not error");
+    wait_until_async(
+        || async {
+            state
+                .get_messages()
+                .await
+                .iter()
+                .any(|message| message.get("t").and_then(|value| value.as_str()) == Some("p"))
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let cid = client_order_id_to_cid(&client_order_id);
+    *state.open_orders_payload.lock().await = Some(serde_json::json!({
+        "orders": [create_open_order("OID-CLOSED", "EURUSD-PERP", "CANCELED", Some(cid))]
+    }));
+
+    let cmd = order_status_report_cmd(None, Some(client_order_id), None);
+    let first = client.generate_order_status_report_task(&cmd).unwrap();
+    let second = client.generate_order_status_report_task(&cmd).unwrap();
+    let core_thread = std::thread::current().id();
+    let runtime = nautilus_common::live::get_runtime();
+
+    // Collection leaves cid tracking intact, so a later collection still resolves the order
+    for collection in [first.collection, second.collection] {
+        runtime
+            .spawn(async move {
+                assert_ne!(std::thread::current().id(), core_thread);
+                collection.await;
+            })
+            .await
+            .unwrap();
+    }
+
+    let first = first.result.await.unwrap().expect("first report");
+    let second = second.result.await.unwrap().expect("second report");
+    assert_eq!(first.client_order_id, Some(client_order_id));
+    assert_eq!(first.order_status, OrderStatus::Canceled);
+    assert_eq!(second.client_order_id, Some(client_order_id));
+
+    // The finish continuation released the closed order's cid tracking on the core thread
+    let after = client.generate_order_status_report(&cmd).await.unwrap();
+    assert!(
+        after.is_none(),
+        "cid tracking should be released: {after:?}"
+    );
+    let cmd = order_status_report_cmd(None, None, Some(VenueOrderId::from("OID-CLOSED")));
+    let unresolved = client
+        .generate_order_status_report(&cmd)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unresolved.client_order_id,
+        Some(ClientOrderId::new(format!("CID-{cid}")))
+    );
 
     client.disconnect().await.expect("Failed to disconnect");
 }
@@ -1486,7 +1918,7 @@ fn create_historical_order(oid: &str, status: &str, ts: i64) -> serde_json::Valu
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_filters() {
+async fn test_generate_fill_reports_filters(#[values(false, true)] worker: bool) {
     let (addr, state) = start_test_server().await.unwrap();
 
     *state.fills_payload.lock().await = Some(serde_json::json!({
@@ -1551,8 +1983,7 @@ async fn test_generate_fill_reports_filters() {
         None,
         None,
     );
-    let reports = client
-        .generate_fill_reports(cmd)
+    let reports = generate_fills(&client, cmd, worker)
         .await
         .expect("generate_fill_reports");
     assert_eq!(reports.len(), 3);
@@ -1568,7 +1999,7 @@ async fn test_generate_fill_reports_filters() {
         None,
         None,
     );
-    let reports = client.generate_fill_reports(cmd).await.unwrap();
+    let reports = generate_fills(&client, cmd, worker).await.unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].trade_id.to_string(), "T-2");
 
@@ -1583,7 +2014,7 @@ async fn test_generate_fill_reports_filters() {
         None,
         None,
     );
-    let reports = client.generate_fill_reports(cmd).await.unwrap();
+    let reports = generate_fills(&client, cmd, worker).await.unwrap();
     assert_eq!(reports.len(), 2);
     assert!(reports.iter().all(|r| r.venue_order_id.as_str() == "OID-A"));
 
@@ -1592,7 +2023,7 @@ async fn test_generate_fill_reports_filters() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_reads_all_cursor_pages() {
+async fn test_generate_fill_reports_reads_all_cursor_pages(#[values(false, true)] worker: bool) {
     let (addr, state) = start_test_server().await.unwrap();
     let fills = (0..101)
         .map(|index| {
@@ -1630,7 +2061,7 @@ async fn test_generate_fill_reports_reads_all_cursor_pages() {
         None,
         None,
     );
-    let reports = client.generate_fill_reports(cmd).await.unwrap();
+    let reports = generate_fills(&client, cmd, worker).await.unwrap();
     let trade_ids = reports
         .iter()
         .map(|report| report.trade_id)
@@ -1646,7 +2077,9 @@ async fn test_generate_fill_reports_reads_all_cursor_pages() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_rejects_duplicate_trade_ids() {
+async fn test_generate_fill_reports_rejects_duplicate_trade_ids(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, state) = start_test_server().await.unwrap();
     let fill = serde_json::json!({
         "trade_id": "T-DUPLICATE",
@@ -1682,7 +2115,7 @@ async fn test_generate_fill_reports_rejects_duplicate_trade_ids() {
         None,
         None,
     );
-    let error = client.generate_fill_reports(cmd).await.unwrap_err();
+    let error = generate_fills(&client, cmd, worker).await.unwrap_err();
 
     assert_eq!(
         error.to_string(),
@@ -1694,7 +2127,9 @@ async fn test_generate_fill_reports_rejects_duplicate_trade_ids() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_fill_reports_rejects_ambiguous_fill_classification() {
+async fn test_generate_fill_reports_rejects_ambiguous_fill_classification(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, state) = start_test_server().await.unwrap();
     *state.fills_payload.lock().await = Some(serde_json::json!({
         "fills": [{
@@ -1727,7 +2162,7 @@ async fn test_generate_fill_reports_rejects_ambiguous_fill_classification() {
         None,
         None,
     );
-    let result = client.generate_fill_reports(cmd).await;
+    let result = generate_fills(&client, cmd, worker).await;
 
     let error = result.unwrap_err();
 
@@ -2024,7 +2459,7 @@ async fn test_cancel_already_terminal_order_is_forwarded() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_position_status_reports_filters() {
+async fn test_generate_position_status_reports_filters(#[values(false, true)] worker: bool) {
     let (addr, state) = start_test_server().await.unwrap();
 
     *state.positions_payload.lock().await = Some(serde_json::json!({
@@ -2072,8 +2507,7 @@ async fn test_generate_position_status_reports_filters() {
         None,
         None,
     );
-    let reports = client
-        .generate_position_status_reports(&cmd)
+    let reports = generate_positions(&client, &cmd, worker)
         .await
         .expect("generate_position_status_reports");
     assert_eq!(reports.len(), 2);
@@ -2088,7 +2522,7 @@ async fn test_generate_position_status_reports_filters() {
         None,
         None,
     );
-    let reports = client.generate_position_status_reports(&cmd).await.unwrap();
+    let reports = generate_positions(&client, &cmd, worker).await.unwrap();
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].instrument_id, InstrumentId::from("XAU-PERP.AX"),);
 

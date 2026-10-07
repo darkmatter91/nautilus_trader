@@ -41,7 +41,7 @@ use axum::{
 };
 use nautilus_common::{
     cache::Cache,
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     live::runner::set_exec_event_sender,
     messages::{
         ExecutionEvent,
@@ -76,6 +76,7 @@ use nautilus_model::{
         LimitOrder, Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs,
     },
     position::Position,
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -1066,7 +1067,9 @@ async fn test_spot_mass_status_incomplete_when_historical_fill_unparsable() {
 /// a close the venue never confirmed, and the engine acts on that by fabricating a fill.
 #[rstest]
 #[tokio::test]
-async fn test_spot_margin_bulk_reports_leave_an_unleveraged_cached_position_alone() {
+async fn test_spot_margin_bulk_reports_leave_an_unleveraged_cached_position_alone(
+    #[values(false, true)] worker: bool,
+) {
     let (addr, _state) = start_test_server().await.unwrap();
     let (client, _rx, cache) = create_test_spot_margin_execution_client(addr);
 
@@ -1100,8 +1103,9 @@ async fn test_spot_margin_bulk_reports_leave_an_unleveraged_cached_position_alon
         .add_position(&position, OmsType::Netting)
         .unwrap();
 
-    let reports = client
-        .generate_position_status_reports(&GeneratePositionStatusReports::new(
+    let reports = position_reports(
+        &client,
+        &GeneratePositionStatusReports::new(
             UUID4::new(),
             UnixNanos::default(),
             None,
@@ -1109,9 +1113,11 @@ async fn test_spot_margin_bulk_reports_leave_an_unleveraged_cached_position_alon
             None,
             None,
             None,
-        ))
-        .await
-        .unwrap();
+        ),
+        worker,
+    )
+    .await
+    .unwrap();
 
     assert!(
         reports.is_empty(),
@@ -1253,7 +1259,9 @@ fn futures_open_orders_json(order_id: &str, symbol: &str) -> String {
 /// futures instrument ids share the `KRAKEN` venue.
 #[rstest]
 #[tokio::test]
-async fn test_futures_scoped_position_reports_match_the_resolved_instrument() {
+async fn test_futures_scoped_position_reports_match_the_resolved_instrument(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, _cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     *state.futures_open_positions_json.lock().await =
@@ -1272,12 +1280,13 @@ async fn test_futures_scoped_position_reports_match_the_resolved_instrument() {
     };
 
     // Control: scoped to the instrument that holds the position, it is returned.
-    let scoped = client
-        .generate_position_status_reports(&positions_cmd(Some(InstrumentId::from(
-            "PI_XBTUSD.KRAKEN",
-        ))))
-        .await
-        .unwrap();
+    let scoped = position_reports(
+        &client,
+        &positions_cmd(Some(InstrumentId::from("PI_XBTUSD.KRAKEN"))),
+        worker,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         scoped.len(),
         1,
@@ -1288,12 +1297,13 @@ async fn test_futures_scoped_position_reports_match_the_resolved_instrument() {
         InstrumentId::from("PI_XBTUSD.KRAKEN")
     );
 
-    let absent = client
-        .generate_position_status_reports(&positions_cmd(Some(InstrumentId::from(
-            "BTC/USD.KRAKEN",
-        ))))
-        .await
-        .unwrap();
+    let absent = position_reports(
+        &client,
+        &positions_cmd(Some(InstrumentId::from("BTC/USD.KRAKEN"))),
+        worker,
+    )
+    .await
+    .unwrap();
     assert!(
         absent.is_empty(),
         "a spot id must match no futures position: {absent:?}"
@@ -1303,7 +1313,9 @@ async fn test_futures_scoped_position_reports_match_the_resolved_instrument() {
 /// The same rule for the futures open-order read with `open_only=false`.
 #[rstest]
 #[tokio::test]
-async fn test_futures_scoped_order_reports_match_the_resolved_instrument() {
+async fn test_futures_scoped_order_reports_match_the_resolved_instrument(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, _cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     *state.futures_open_orders_json.lock().await =
@@ -1323,10 +1335,13 @@ async fn test_futures_scoped_order_reports_match_the_resolved_instrument() {
     };
 
     // Control: scoped to the instrument that holds the order, it is returned.
-    let scoped = client
-        .generate_order_status_reports(&orders_cmd(Some(InstrumentId::from("PI_XBTUSD.KRAKEN"))))
-        .await
-        .unwrap();
+    let scoped = order_reports(
+        &client,
+        &orders_cmd(Some(InstrumentId::from("PI_XBTUSD.KRAKEN"))),
+        worker,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         scoped.len(),
         1,
@@ -1337,10 +1352,13 @@ async fn test_futures_scoped_order_reports_match_the_resolved_instrument() {
         InstrumentId::from("PI_XBTUSD.KRAKEN")
     );
 
-    let absent = client
-        .generate_order_status_reports(&orders_cmd(Some(InstrumentId::from("BTC/USD.KRAKEN"))))
-        .await
-        .unwrap();
+    let absent = order_reports(
+        &client,
+        &orders_cmd(Some(InstrumentId::from("BTC/USD.KRAKEN"))),
+        worker,
+    )
+    .await
+    .unwrap();
     assert!(
         absent.is_empty(),
         "a spot id must match no futures order: {absent:?}"
@@ -1360,7 +1378,9 @@ fn futures_fills_for_symbol(symbol: &str) -> String {
 /// client. It must match nothing rather than falling through and returning every instrument's rows.
 #[rstest]
 #[tokio::test]
-async fn test_futures_scoped_fill_reports_match_the_resolved_instrument() {
+async fn test_futures_scoped_fill_reports_match_the_resolved_instrument(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, _cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     *state.fills_response.lock().await = Some(futures_fills_for_symbol("PI_XBTUSD"));
@@ -1380,23 +1400,31 @@ async fn test_futures_scoped_fill_reports_match_the_resolved_instrument() {
 
     // Control: unscoped, the fill is read. Without this the assertions below could pass because
     // the venue returned nothing.
-    let control = client.generate_fill_reports(fills_cmd(None)).await.unwrap();
-    assert_eq!(control.len(), 1);
-
-    let scoped = client
-        .generate_fill_reports(fills_cmd(Some(InstrumentId::from("PI_XBTUSD.KRAKEN"))))
+    let control = fill_reports(&client, fills_cmd(None), worker)
         .await
         .unwrap();
+    assert_eq!(control.len(), 1);
+
+    let scoped = fill_reports(
+        &client,
+        fills_cmd(Some(InstrumentId::from("PI_XBTUSD.KRAKEN"))),
+        worker,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         scoped.len(),
         1,
         "the instrument's own fill must be returned"
     );
 
-    let absent = client
-        .generate_fill_reports(fills_cmd(Some(InstrumentId::from("BTC/USD.KRAKEN"))))
-        .await
-        .unwrap();
+    let absent = fill_reports(
+        &client,
+        fills_cmd(Some(InstrumentId::from("BTC/USD.KRAKEN"))),
+        worker,
+    )
+    .await
+    .unwrap();
     assert!(
         absent.is_empty(),
         "a spot id must match nothing on the futures client: {absent:?}"
@@ -2574,7 +2602,9 @@ async fn test_futures_mass_status_converges_part_filled_hold_from_orders_status(
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_open_order_reports_include_orders_status_window() {
+async fn test_futures_open_order_reports_include_orders_status_window(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     let order = add_limit_order_to_cache(&cache, ClientOrderId::new("futures-held-002"));
@@ -2592,7 +2622,7 @@ async fn test_futures_open_order_reports_include_orders_status_window() {
         None,
     );
 
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = order_reports(&client, &cmd, worker).await.unwrap();
 
     let report = reports
         .iter()
@@ -2614,7 +2644,9 @@ async fn test_futures_open_order_reports_include_orders_status_window() {
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_targeted_order_status_resolves_held_order_by_client_id() {
+async fn test_futures_targeted_order_status_resolves_held_order_by_client_id(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     add_limit_order_to_cache(&cache, ClientOrderId::new("cli+ord&id=001"));
@@ -2630,7 +2662,7 @@ async fn test_futures_targeted_order_status_resolves_held_order_by_client_id() {
         None,
     );
 
-    let report = client.generate_order_status_report(&cmd).await.unwrap();
+    let report = order_report(&client, &cmd, worker).await.unwrap();
 
     let report = report.expect("held order resolved by client order ID");
     assert_eq!(report.venue_order_id, VenueOrderId::from("V-HELD-003"));
@@ -2652,7 +2684,9 @@ async fn test_futures_targeted_order_status_resolves_held_order_by_client_id() {
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_orders_status_failure_fails_report_generation() {
+async fn test_futures_orders_status_failure_fails_report_generation(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     let order = add_limit_order_to_cache(&cache, ClientOrderId::new("futures-held-005"));
@@ -2671,7 +2705,7 @@ async fn test_futures_orders_status_failure_fails_report_generation() {
         None,
     );
 
-    let result = client.generate_order_status_reports(&cmd).await;
+    let result = order_reports(&client, &cmd, worker).await;
 
     let error = result.expect_err("orders-status failure must propagate");
     assert!(
@@ -2716,7 +2750,9 @@ fn fills_fully_executed_now() -> String {
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_targeted_fully_executed_prefers_fill_pricing() {
+async fn test_futures_targeted_fully_executed_prefers_fill_pricing(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     add_limit_order_to_cache(&cache, ClientOrderId::new("futures-filled-006"));
@@ -2733,7 +2769,7 @@ async fn test_futures_targeted_fully_executed_prefers_fill_pricing() {
         None,
     );
 
-    let report = client.generate_order_status_report(&cmd).await.unwrap();
+    let report = order_report(&client, &cmd, worker).await.unwrap();
 
     let report = report.expect("fully executed order resolved");
     assert_eq!(report.order_status, OrderStatus::Filled);
@@ -2823,7 +2859,9 @@ const ORDERS_STATUS_UNPARSABLE_QUANTITY: &str = r#"{
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_open_order_reports_exclude_unpriced_filled() {
+async fn test_futures_open_order_reports_exclude_unpriced_filled(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     let open_order = add_limit_order_to_cache(&cache, ClientOrderId::new("futures-held-007"));
@@ -2843,7 +2881,7 @@ async fn test_futures_open_order_reports_exclude_unpriced_filled() {
         None,
     );
 
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let reports = order_reports(&client, &cmd, worker).await.unwrap();
 
     assert!(
         reports
@@ -2861,7 +2899,9 @@ async fn test_futures_open_order_reports_exclude_unpriced_filled() {
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_targeted_fully_executed_without_fills_defers() {
+async fn test_futures_targeted_fully_executed_without_fills_defers(
+    #[values(false, true)] worker: bool,
+) {
     let (client, _rx, cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     add_limit_order_to_cache(&cache, ClientOrderId::new("futures-filled-006"));
@@ -2877,7 +2917,7 @@ async fn test_futures_targeted_fully_executed_without_fills_defers() {
         None,
     );
 
-    let result = client.generate_order_status_report(&cmd).await;
+    let result = order_report(&client, &cmd, worker).await;
 
     let error = result.expect_err("unpriced fully executed order must defer");
     assert!(
@@ -2888,7 +2928,9 @@ async fn test_futures_targeted_fully_executed_without_fills_defers() {
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_orders_status_parse_failure_fails_lookup() {
+async fn test_futures_orders_status_parse_failure_fails_lookup(
+    #[values(false, true)] worker: bool,
+) {
     // Ok(None) would let recon close an order that is live at the venue
     let (client, _rx, cache, state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
@@ -2906,7 +2948,7 @@ async fn test_futures_orders_status_parse_failure_fails_lookup() {
         None,
     );
 
-    let result = client.generate_order_status_report(&cmd).await;
+    let result = order_report(&client, &cmd, worker).await;
 
     let error = result.expect_err("unparsable entry must fail the lookup");
     assert!(
@@ -2919,7 +2961,7 @@ async fn test_futures_orders_status_parse_failure_fails_lookup() {
 
 #[rstest]
 #[tokio::test]
-async fn test_futures_targeted_absent_order_returns_none() {
+async fn test_futures_targeted_absent_order_returns_none(#[values(false, true)] worker: bool) {
     let (client, _rx, cache, _state) =
         connected_client_with_command_responses(CommandResponses::default()).await;
     add_limit_order_to_cache(&cache, ClientOrderId::new("futures-absent-010"));
@@ -2934,7 +2976,7 @@ async fn test_futures_targeted_absent_order_returns_none() {
         None,
     );
 
-    let report = client.generate_order_status_report(&cmd).await.unwrap();
+    let report = order_report(&client, &cmd, worker).await.unwrap();
 
     assert_eq!(report, None, "venue absence must surface as Ok(None)");
 }
@@ -4102,4 +4144,392 @@ async fn test_whole_cancel_all_failure_does_not_emit_cancel_rejected() {
         matches!(event, OrderEventAny::CancelRejected(_))
     })
     .await;
+}
+
+/// Runs a report task the way the live facade does: collection on a runtime task, then the
+/// continuation on the calling (core) thread.
+/// Runs two report tasks while the live cache is mutably borrowed throughout.
+#[expect(
+    clippy::await_holding_refcell_ref,
+    reason = "worker report tasks must finish without accessing the borrowed live cache"
+)]
+async fn run_report_tasks_with_cache_borrowed<A: 'static, B: 'static>(
+    cache: &Rc<RefCell<Cache>>,
+    first: ExecutionReportTask<A>,
+    second: ExecutionReportTask<B>,
+) -> (A, B) {
+    let _cache_borrow = cache.borrow_mut();
+    let first = run_report_task(first).await.unwrap();
+    let second = run_report_task(second).await.unwrap();
+    (first, second)
+}
+
+async fn run_report_task<T: 'static>(task: ExecutionReportTask<T>) -> anyhow::Result<T> {
+    let core_thread = std::thread::current().id();
+    let multi_thread = tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread;
+    tokio::spawn(async move {
+        if multi_thread {
+            assert_ne!(std::thread::current().id(), core_thread);
+        }
+        task.collection.await;
+    })
+    .await
+    .unwrap();
+
+    task.result.await
+}
+
+async fn order_report<C: ExecutionClient>(
+    client: &C,
+    cmd: &GenerateOrderStatusReport,
+    worker: bool,
+) -> anyhow::Result<Option<OrderStatusReport>> {
+    if worker {
+        run_report_task(client.generate_order_status_report_task(cmd).unwrap()).await
+    } else {
+        client.generate_order_status_report(cmd).await
+    }
+}
+
+async fn order_reports<C: ExecutionClient>(
+    client: &C,
+    cmd: &GenerateOrderStatusReports,
+    worker: bool,
+) -> anyhow::Result<Vec<OrderStatusReport>> {
+    if worker {
+        run_report_task(client.generate_order_status_reports_task(cmd).unwrap()).await
+    } else {
+        client.generate_order_status_reports(cmd).await
+    }
+}
+
+async fn fill_reports<C: ExecutionClient>(
+    client: &C,
+    cmd: GenerateFillReports,
+    worker: bool,
+) -> anyhow::Result<Vec<FillReport>> {
+    if worker {
+        run_report_task(client.generate_fill_reports_task(&cmd).unwrap()).await
+    } else {
+        client.generate_fill_reports(cmd).await
+    }
+}
+
+async fn position_reports<C: ExecutionClient>(
+    client: &C,
+    cmd: &GeneratePositionStatusReports,
+    worker: bool,
+) -> anyhow::Result<Vec<PositionStatusReport>> {
+    if worker {
+        run_report_task(client.generate_position_status_reports_task(cmd).unwrap()).await
+    } else {
+        client.generate_position_status_reports(cmd).await
+    }
+}
+
+/// Asserts a worker report equals its inline counterpart apart from per-report identity.
+fn assert_report_fields<T: serde::Serialize>(inline: &T, worker: &T) {
+    let mut inline = serde_json::to_value(inline).unwrap();
+    let mut worker = serde_json::to_value(worker).unwrap();
+    assert_ne!(inline["report_id"], worker["report_id"]);
+
+    for value in [&mut inline, &mut worker] {
+        let object = value.as_object_mut().unwrap();
+        object.remove("report_id");
+        object.remove("ts_init");
+
+        // Position reports stamp ts_last at generation time
+        if object.contains_key("signed_decimal_qty") {
+            object.remove("ts_last");
+        }
+    }
+
+    assert_eq!(worker, inline);
+}
+
+fn assert_reports_match<T: serde::Serialize>(inline: &[T], worker: &[T]) {
+    assert!(!inline.is_empty(), "the control must read reports");
+    assert_eq!(inline.len(), worker.len());
+
+    for (inline, worker) in inline.iter().zip(worker) {
+        assert_report_fields(inline, worker);
+    }
+}
+
+fn all_order_reports_cmd(open_only: bool) -> GenerateOrderStatusReports {
+    GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        open_only,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+fn all_fill_reports_cmd() -> GenerateFillReports {
+    GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+fn all_position_reports_cmd() -> GeneratePositionStatusReports {
+    GeneratePositionStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::await_holding_refcell_ref,
+    reason = "worker report tasks must finish without accessing the borrowed live cache"
+)]
+async fn test_spot_report_tasks_match_inline_fields() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, _rx, cache) = create_test_spot_wallet_execution_client(addr);
+    add_test_spot_account_to_cache(&cache);
+    client.connect().await.unwrap();
+
+    let single = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        Some(VenueOrderId::from("O26VBY-ISGAE-JP5TLU")),
+        None,
+        None,
+    );
+    let orders = all_order_reports_cmd(true);
+    let fills = all_fill_reports_cmd();
+    let positions = all_position_reports_cmd();
+
+    *state.trades_history_json.lock().await = Some(spot_trades_json(&["XBTUSDT"]));
+    let inline_single = client
+        .generate_order_status_report(&single)
+        .await
+        .unwrap()
+        .unwrap();
+    let inline_orders = client.generate_order_status_reports(&orders).await.unwrap();
+    let inline_fills = client.generate_fill_reports(fills.clone()).await.unwrap();
+    let inline_positions = client
+        .generate_position_status_reports(&positions)
+        .await
+        .unwrap();
+
+    *state.trades_history_json.lock().await = Some(spot_trades_json(&["XBTUSDT"]));
+    let single_task = client.generate_order_status_report_task(&single).unwrap();
+    let orders_task = client.generate_order_status_reports_task(&orders).unwrap();
+    let fills_task = client.generate_fill_reports_task(&fills).unwrap();
+    let positions_task = client
+        .generate_position_status_reports_task(&positions)
+        .unwrap();
+    let cache_borrow = cache.borrow_mut();
+    let worker_single = run_report_task(single_task).await.unwrap().unwrap();
+    let worker_orders = run_report_task(orders_task).await.unwrap();
+    let worker_fills = run_report_task(fills_task).await.unwrap();
+    let worker_positions = run_report_task(positions_task).await.unwrap();
+    drop(cache_borrow);
+
+    assert_eq!(
+        inline_single.venue_order_id,
+        VenueOrderId::from("O26VBY-ISGAE-JP5TLU")
+    );
+    assert_report_fields(&inline_single, &worker_single);
+    assert_reports_match(&inline_orders, &worker_orders);
+    assert_reports_match(&inline_fills, &worker_fills);
+    assert_reports_match(&inline_positions, &worker_positions);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_spot_report_task_propagates_venue_error(#[values(false, true)] worker: bool) {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (mut client, _rx, cache) = create_test_spot_execution_client(addr);
+    add_test_spot_account_to_cache(&cache);
+    client.connect().await.unwrap();
+    *state.trades_history_json.lock().await =
+        Some(r#"{"error":["EService:Unavailable"]}"#.to_string());
+
+    let error = fill_reports(&client, all_fill_reports_cmd(), worker)
+        .await
+        .expect_err("a venue error must fail the fill read rather than report no fills");
+
+    assert!(
+        format!("{error:#}").contains("EService:Unavailable"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::await_holding_refcell_ref,
+    reason = "worker report tasks must finish without accessing the borrowed live cache"
+)]
+async fn test_futures_report_tasks_match_inline_fields() {
+    let (client, _rx, cache, state) =
+        connected_client_with_command_responses(CommandResponses::default()).await;
+    *state.futures_open_orders_json.lock().await =
+        Some(futures_open_orders_json("V-PARITY-001", "PI_XBTUSD"));
+    *state.fills_response.lock().await = Some(futures_fills_for_symbol("PI_XBTUSD"));
+    *state.futures_open_positions_json.lock().await =
+        Some(futures_open_positions_json("PI_XBTUSD"));
+
+    // A cached open order absent from /openorders exercises the orders-status extension
+    let held = add_limit_order_to_cache(&cache, ClientOrderId::new("futures-held-002"));
+    set_venue_order_id_on_cached_order(&cache, &held, "V-HELD-002");
+    *state.orders_status_response.lock().await = Some(ORDERS_STATUS_ENTERED_BOOK.to_string());
+
+    let single = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(InstrumentId::from("PI_XBTUSD.KRAKEN")),
+        None,
+        Some(VenueOrderId::from("V-PARITY-001")),
+        None,
+        None,
+    );
+    let held_single = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(InstrumentId::from("PI_XBTUSD.KRAKEN")),
+        Some(ClientOrderId::new("futures-held-002")),
+        None,
+        None,
+        None,
+    );
+    let orders = all_order_reports_cmd(true);
+    let fills = all_fill_reports_cmd();
+    let positions = all_position_reports_cmd();
+
+    let inline_single = client
+        .generate_order_status_report(&single)
+        .await
+        .unwrap()
+        .unwrap();
+    let inline_held = client
+        .generate_order_status_report(&held_single)
+        .await
+        .unwrap()
+        .unwrap();
+    let inline_orders = client.generate_order_status_reports(&orders).await.unwrap();
+    let inline_fills = client.generate_fill_reports(fills.clone()).await.unwrap();
+    let inline_positions = client
+        .generate_position_status_reports(&positions)
+        .await
+        .unwrap();
+
+    let single_task = client.generate_order_status_report_task(&single).unwrap();
+    let held_task = client
+        .generate_order_status_report_task(&held_single)
+        .unwrap();
+    let orders_task = client.generate_order_status_reports_task(&orders).unwrap();
+    let fills_task = client.generate_fill_reports_task(&fills).unwrap();
+    let positions_task = client
+        .generate_position_status_reports_task(&positions)
+        .unwrap();
+    let cache_borrow = cache.borrow_mut();
+    let worker_single = run_report_task(single_task).await.unwrap().unwrap();
+    let worker_held = run_report_task(held_task).await.unwrap().unwrap();
+    let worker_orders = run_report_task(orders_task).await.unwrap();
+    let worker_fills = run_report_task(fills_task).await.unwrap();
+    let worker_positions = run_report_task(positions_task).await.unwrap();
+    drop(cache_borrow);
+
+    assert_eq!(
+        inline_single.venue_order_id,
+        VenueOrderId::from("V-PARITY-001")
+    );
+    assert_eq!(inline_held.venue_order_id, VenueOrderId::from("V-HELD-002"));
+    assert!(
+        inline_orders
+            .iter()
+            .any(|report| report.venue_order_id == VenueOrderId::from("V-HELD-002")),
+        "the control must include the orders-status extension: {inline_orders:?}"
+    );
+    assert_report_fields(&inline_single, &worker_single);
+    assert_report_fields(&inline_held, &worker_held);
+    assert_reports_match(&inline_orders, &worker_orders);
+    assert_reports_match(&inline_fills, &worker_fills);
+    assert_reports_match(&inline_positions, &worker_positions);
+}
+
+/// Report tasks read cached orders on the core thread when the task is created.
+///
+/// Collection never touches the cache, so an order cached after the task was created is not
+/// consulted, while one cached before it is resolved even if the cache is borrowed throughout
+/// collection.
+#[rstest]
+#[tokio::test]
+async fn test_futures_report_tasks_capture_cached_orders_on_core(
+    #[values(false, true)] cached_before_task: bool,
+) {
+    let (client, _rx, cache, state) =
+        connected_client_with_command_responses(CommandResponses::default()).await;
+    *state.orders_status_response.lock().await = Some(ORDERS_STATUS_ENTERED_BOOK.to_string());
+    let client_order_id = ClientOrderId::new("futures-held-002");
+    let single = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(InstrumentId::from("PI_XBTUSD.KRAKEN")),
+        Some(client_order_id),
+        None,
+        None,
+        None,
+    );
+    let orders = all_order_reports_cmd(true);
+
+    let cache_order = || {
+        let order = add_limit_order_to_cache(&cache, client_order_id);
+        set_venue_order_id_on_cached_order(&cache, &order, "V-HELD-002");
+    };
+
+    if cached_before_task {
+        cache_order();
+    }
+
+    let single_task = client.generate_order_status_report_task(&single).unwrap();
+    let orders_task = client.generate_order_status_reports_task(&orders).unwrap();
+
+    if !cached_before_task {
+        cache_order();
+    }
+
+    let (single_report, order_reports) =
+        run_report_tasks_with_cache_borrowed(&cache, single_task, orders_task).await;
+
+    let orders_status_requested = state.orders_status_request_body.lock().await.is_some();
+    assert_eq!(orders_status_requested, cached_before_task);
+
+    if cached_before_task {
+        let report = single_report.expect("held order resolved from the captured cached order");
+        assert_eq!(report.venue_order_id, VenueOrderId::from("V-HELD-002"));
+        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert!(
+            order_reports
+                .iter()
+                .any(|report| report.venue_order_id == VenueOrderId::from("V-HELD-002")),
+            "held order reported from the captured open orders: {order_reports:?}"
+        );
+    } else {
+        assert_eq!(single_report, None);
+        assert!(order_reports.is_empty(), "{order_reports:?}");
+    }
 }

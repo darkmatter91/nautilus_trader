@@ -419,6 +419,13 @@ formula does not account for contract size. Configure `default_taker_fee` on
 | Order status updates | ✓    | ✓            | ✓            | Real-time order state changes. |
 | Trade history        | ✓    | ✓            | ✓            | Execution and fill reports.    |
 
+`LiveNode` fetches single-order, bulk order, and fill reports over HTTP on workers for Spot and
+Futures, and Futures position reports as well. Cache-dependent work stays on its main thread.
+Futures selects the Algo Service lookup route from the cached order type before collection, and
+checks venue position IDs against current cached open positions after collection. Spot position
+reports return an empty list without venue requests and stay on the main thread. Startup and
+post-reconnect mass status bypass these hooks.
+
 #### Futures trade-history retention
 
 Binance retains USD-M and COIN-M account trades for the past three months. Because Binance does not

@@ -27,7 +27,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -296,12 +296,13 @@ impl CoinbaseExecutionClient {
         self.core.account_type == AccountType::Margin
     }
 
-    // Returns true when the instrument resides in the connect-time bootstrap
-    // cache. For the Cash (spot) factory this gates spot-only traffic; for the
-    // Margin factory the cache contains CFM perp + future products.
-    fn is_instrument_cached(&self, instrument_id: &InstrumentId) -> bool {
-        self.instruments_cache
-            .contains_key(instrument_id.symbol.as_str())
+    fn report_client(&self) -> CoinbaseReportClient {
+        CoinbaseReportClient {
+            account_id: self.core.account_id,
+            http_client: self.http_client.clone(),
+            instruments: Arc::clone(&self.instruments_cache),
+            is_margin: self.is_margin(),
+        }
     }
 
     async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
@@ -695,117 +696,83 @@ impl ExecutionClient for CoinbaseExecutionClient {
         Ok(())
     }
 
+    fn generate_order_status_report_task(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_report(&command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_reports(&command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_fill_reports(&command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_position_status_reports_task(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_position_status_reports(&command).await },
+            Ok,
+        ))
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let report = self
-            .http_client
-            .request_order_status_report(
-                self.core.account_id,
-                cmd.client_order_id,
-                cmd.venue_order_id,
-            )
-            .await
-            .ok();
-
-        // Filter reports to instruments this client bootstrapped. A Cash
-        // client drops derivatives reports (and vice-versa) so mixed activity
-        // on the same venue account does not poison the engine state
-        // associated with either exec client.
-        Ok(report.filter(|r| self.is_instrument_cached(&r.instrument_id)))
+        self.report_client().collect_order_status_report(cmd).await
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        let start = cmd.start.map(|ts| ts.to_datetime_utc());
-        let end = cmd.end.map(|ts| ts.to_datetime_utc());
-
-        let mut reports = self
-            .http_client
-            .request_order_status_reports(
-                self.core.account_id,
-                cmd.instrument_id,
-                cmd.open_only,
-                start,
-                end,
-                None,
-            )
-            .await?;
-
-        let before = reports.len();
-        reports.retain(|r| self.is_instrument_cached(&r.instrument_id));
-        if reports.len() != before {
-            let scope = if self.is_margin() {
-                "non-futures"
-            } else {
-                "non-spot"
-            };
-            log::debug!("Filtered {} {scope} order reports", before - reports.len());
-        }
-        Ok(reports)
+        let client = self.report_client();
+        client.collect_order_status_reports(cmd).await
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let start = cmd.start.map(|ts| ts.to_datetime_utc());
-        let end = cmd.end.map(|ts| ts.to_datetime_utc());
-
-        let mut reports = self
-            .http_client
-            .request_fill_reports(
-                self.core.account_id,
-                cmd.instrument_id,
-                cmd.venue_order_id,
-                start,
-                end,
-                None,
-            )
-            .await?;
-
-        let before = reports.len();
-        reports.retain(|r| self.is_instrument_cached(&r.instrument_id));
-        if reports.len() != before {
-            let scope = if self.is_margin() {
-                "non-futures"
-            } else {
-                "non-spot"
-            };
-            log::debug!("Filtered {} {scope} fill reports", before - reports.len());
-        }
-        Ok(reports)
+        self.report_client().collect_fill_reports(&cmd).await
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        // Coinbase spot has no positions.
-        if !self.is_margin() {
-            return Ok(Vec::new());
-        }
-
-        // Errors propagate (matching `generate_order_status_reports` /
-        // `generate_fill_reports`) so `generate_mass_status` and the live
-        // manager's reconciliation path see venue failures rather than
-        // receive a silently-empty report set.
-        if let Some(instrument_id) = cmd.instrument_id {
-            let report = self
-                .http_client
-                .request_position_status_report(self.core.account_id, instrument_id)
-                .await
-                .with_context(|| format!("failed to request CFM position for {instrument_id}"))?;
-            Ok(report.map(|r| vec![r]).unwrap_or_default())
-        } else {
-            self.http_client
-                .request_position_status_reports(self.core.account_id)
-                .await
-                .context("failed to request CFM positions")
-        }
+        self.report_client()
+            .collect_position_status_reports(cmd)
+            .await
     }
 
     async fn generate_mass_status(
@@ -1393,6 +1360,134 @@ impl ExecutionClient for CoinbaseExecutionClient {
         });
 
         Ok(())
+    }
+}
+
+// Owned report collection state. Holds no cache or `Rc` state so collection can run on a
+// runtime worker; the instrument scope is the connect-time bootstrap snapshot.
+#[derive(Debug, Clone)]
+struct CoinbaseReportClient {
+    account_id: AccountId,
+    http_client: CoinbaseHttpClient,
+    instruments: Arc<AHashMap<String, InstrumentAny>>,
+    is_margin: bool,
+}
+
+impl CoinbaseReportClient {
+    // Returns true when the instrument resides in the connect-time bootstrap
+    // cache. For the Cash (spot) factory this gates spot-only traffic; for the
+    // Margin factory the cache contains CFM perp + future products.
+    fn is_instrument_cached(&self, instrument_id: &InstrumentId) -> bool {
+        self.instruments.contains_key(instrument_id.symbol.as_str())
+    }
+
+    fn scope(&self) -> &'static str {
+        if self.is_margin {
+            "non-futures"
+        } else {
+            "non-spot"
+        }
+    }
+
+    async fn collect_order_status_report(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let report = self
+            .http_client
+            .request_order_status_report(self.account_id, cmd.client_order_id, cmd.venue_order_id)
+            .await
+            .ok();
+
+        // Filter reports to instruments this client bootstrapped. A Cash
+        // client drops derivatives reports (and vice-versa) so mixed activity
+        // on the same venue account does not poison the engine state
+        // associated with either exec client.
+        Ok(report.filter(|r| self.is_instrument_cached(&r.instrument_id)))
+    }
+
+    async fn collect_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let start = cmd.start.map(|ts| ts.to_datetime_utc());
+        let end = cmd.end.map(|ts| ts.to_datetime_utc());
+
+        let mut reports = self
+            .http_client
+            .request_order_status_reports(
+                self.account_id,
+                cmd.instrument_id,
+                cmd.open_only,
+                start,
+                end,
+                None,
+            )
+            .await?;
+
+        let before = reports.len();
+        reports.retain(|r| self.is_instrument_cached(&r.instrument_id));
+        if reports.len() != before {
+            let scope = self.scope();
+            log::debug!("Filtered {} {scope} order reports", before - reports.len());
+        }
+        Ok(reports)
+    }
+
+    async fn collect_fill_reports(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let start = cmd.start.map(|ts| ts.to_datetime_utc());
+        let end = cmd.end.map(|ts| ts.to_datetime_utc());
+
+        let mut reports = self
+            .http_client
+            .request_fill_reports(
+                self.account_id,
+                cmd.instrument_id,
+                cmd.venue_order_id,
+                start,
+                end,
+                None,
+            )
+            .await?;
+
+        let before = reports.len();
+        reports.retain(|r| self.is_instrument_cached(&r.instrument_id));
+        if reports.len() != before {
+            let scope = self.scope();
+            log::debug!("Filtered {} {scope} fill reports", before - reports.len());
+        }
+        Ok(reports)
+    }
+
+    async fn collect_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        // Coinbase spot has no positions.
+        if !self.is_margin {
+            return Ok(Vec::new());
+        }
+
+        // Errors propagate (matching `generate_order_status_reports` /
+        // `generate_fill_reports`) so `generate_mass_status` and the live
+        // manager's reconciliation path see venue failures rather than
+        // receive a silently-empty report set.
+        if let Some(instrument_id) = cmd.instrument_id {
+            let report = self
+                .http_client
+                .request_position_status_report(self.account_id, instrument_id)
+                .await
+                .with_context(|| format!("failed to request CFM position for {instrument_id}"))?;
+            Ok(report.map(|r| vec![r]).unwrap_or_default())
+        } else {
+            self.http_client
+                .request_position_status_reports(self.account_id)
+                .await
+                .context("failed to request CFM positions")
+        }
     }
 }
 

@@ -21,7 +21,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
-    clients::ExecutionClient,
+    clients::{ExecutionClient, ExecutionReportTask},
     live::runner::get_exec_event_sender,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -165,6 +165,14 @@ impl DeribitExecutionClient {
             session_tasks,
             pending_tasks,
         })
+    }
+
+    fn report_client(&self) -> DeribitReportClient {
+        DeribitReportClient {
+            account_id: self.core.account_id,
+            clock: self.clock,
+            http_client: self.http_client.clone(),
+        }
     }
 
     /// Spawns an async task for execution operations.
@@ -614,107 +622,81 @@ impl ExecutionClient for DeribitExecutionClient {
         Ok(())
     }
 
+    fn generate_order_status_report_task(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_report(&command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<OrderStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_order_status_reports(&command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_fill_reports(command).await },
+            Ok,
+        ))
+    }
+
+    fn generate_position_status_reports_task(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+        let client = self.report_client();
+        let command = cmd.clone();
+        Some(ExecutionReportTask::new(
+            async move { client.collect_position_status_reports(&command).await },
+            Ok,
+        ))
+    }
+
     async fn generate_order_status_report(
         &self,
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
-        // If venue_order_id is provided, fetch the specific order by ID
-        if let Some(venue_order_id) = &cmd.venue_order_id {
-            let params = GetOrderStateParams {
-                order_id: venue_order_id.to_string(),
-            };
-            let ts_init = self.clock.get_time_ns();
-
-            match self.http_client.inner.get_order_state(params).await {
-                Ok(response) => {
-                    if let Some(order) = response.result {
-                        let symbol = order.instrument_name;
-                        if let Some(instrument) = self.http_client.get_instrument(&symbol) {
-                            let report = parse_user_order_msg(
-                                &order,
-                                &instrument,
-                                self.core.account_id,
-                                ts_init,
-                            )?;
-                            return Ok(Some(report));
-                        } else {
-                            log::warn!(
-                                "Instrument {} not in cache for order {}",
-                                order.instrument_name,
-                                order.order_id
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to get order state: {e}");
-                }
-            }
-            return Ok(None);
-        }
-
-        // If client_order_id is provided, search open then closed orders
-        if let Some(client_order_id) = &cmd.client_order_id {
-            let reports = self
-                .http_client
-                .request_order_status_reports(
-                    self.core.account_id,
-                    cmd.instrument_id,
-                    None,
-                    None,
-                    false, // search all orders, not just open
-                )
-                .await?;
-
-            // Filter by client_order_id
-            for report in reports {
-                if report.client_order_id == Some(*client_order_id) {
-                    return Ok(Some(report));
-                }
-            }
-        }
-
-        Ok(None)
+        self.report_client().collect_order_status_report(cmd).await
     }
 
     async fn generate_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
-        self.http_client
-            .request_order_status_reports(
-                self.core.account_id,
-                cmd.instrument_id,
-                cmd.start,
-                cmd.end,
-                cmd.open_only,
-            )
-            .await
+        self.report_client().collect_order_status_reports(cmd).await
     }
 
     async fn generate_fill_reports(
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let mut reports = self
-            .http_client
-            .request_fill_reports(self.core.account_id, cmd.instrument_id, cmd.start, cmd.end)
-            .await?;
-
-        // Filter by venue_order_id if provided
-        if let Some(venue_order_id) = &cmd.venue_order_id {
-            reports.retain(|r| r.venue_order_id == *venue_order_id);
-        }
-
-        Ok(reports)
+        self.report_client().collect_fill_reports(cmd).await
     }
 
     async fn generate_position_status_reports(
         &self,
         cmd: &GeneratePositionStatusReports,
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        self.http_client
-            .request_position_status_reports(self.core.account_id, cmd.instrument_id)
+        self.report_client()
+            .collect_position_status_reports(cmd)
             .await
     }
 
@@ -1138,6 +1120,119 @@ impl ExecutionClient for DeribitExecutionClient {
 }
 
 /// Dispatches a WebSocket message using the event emitter.
+/// Owned HTTP report collection that runs off the core thread without cache access.
+struct DeribitReportClient {
+    account_id: AccountId,
+    clock: &'static AtomicTime,
+    http_client: DeribitHttpClient,
+}
+
+impl DeribitReportClient {
+    async fn collect_order_status_report(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        // If venue_order_id is provided, fetch the specific order by ID
+        if let Some(venue_order_id) = &cmd.venue_order_id {
+            let params = GetOrderStateParams {
+                order_id: venue_order_id.to_string(),
+            };
+            let ts_init = self.clock.get_time_ns();
+
+            match self.http_client.inner.get_order_state(params).await {
+                Ok(response) => {
+                    if let Some(order) = response.result {
+                        let symbol = order.instrument_name;
+                        if let Some(instrument) = self.http_client.get_instrument(&symbol) {
+                            let report = parse_user_order_msg(
+                                &order,
+                                &instrument,
+                                self.account_id,
+                                ts_init,
+                            )?;
+                            return Ok(Some(report));
+                        } else {
+                            log::warn!(
+                                "Instrument {} not in cache for order {}",
+                                order.instrument_name,
+                                order.order_id
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to get order state: {e}");
+                }
+            }
+            return Ok(None);
+        }
+
+        // If client_order_id is provided, search open then closed orders
+        if let Some(client_order_id) = &cmd.client_order_id {
+            let reports = self
+                .http_client
+                .request_order_status_reports(
+                    self.account_id,
+                    cmd.instrument_id,
+                    None,
+                    None,
+                    false, // search all orders, not just open
+                )
+                .await?;
+
+            // Filter by client_order_id
+            for report in reports {
+                if report.client_order_id == Some(*client_order_id) {
+                    return Ok(Some(report));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn collect_order_status_reports(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        self.http_client
+            .request_order_status_reports(
+                self.account_id,
+                cmd.instrument_id,
+                cmd.start,
+                cmd.end,
+                cmd.open_only,
+            )
+            .await
+    }
+
+    async fn collect_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let mut reports = self
+            .http_client
+            .request_fill_reports(self.account_id, cmd.instrument_id, cmd.start, cmd.end)
+            .await?;
+
+        // Filter by venue_order_id if provided
+        if let Some(venue_order_id) = &cmd.venue_order_id {
+            reports.retain(|r| r.venue_order_id == *venue_order_id);
+        }
+
+        Ok(reports)
+    }
+
+    async fn collect_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        self.http_client
+            .request_position_status_reports(self.account_id, cmd.instrument_id)
+            .await
+    }
+}
+
 fn dispatch_ws_message(message: NautilusWsMessage, emitter: &ExecutionEventEmitter) {
     match message {
         NautilusWsMessage::AccountState(state) => {
