@@ -924,7 +924,13 @@ impl Portfolio {
         track_missing_prices: bool,
     ) -> Option<PortfolioSnapshot> {
         let account_id = &account_id;
-        let account = self.cache.borrow().account_owned(account_id)?;
+        // The snapshot reads only current balances and margins, so skip copying the account
+        // event history, which grows with every account state
+        let account = self
+            .cache
+            .borrow()
+            .account_ref(account_id)
+            .map(|account| account.clone_without_events())?;
 
         let balances: Vec<AccountBalance> = account.balances().into_values().collect();
         let margins: Vec<MarginBalance> = match &account {
@@ -3056,15 +3062,12 @@ impl Portfolio {
                 return None;
             }
         };
-        // A price at or below zero is valid where the instrument allows it and its notional does
-        // not divide by price
+
+        // A price at or below zero is valid where the instrument allows it
         let allows_non_positive = || {
-            cache.instrument(instrument_id).is_some_and(|instrument| {
-                instrument.allows_negative_price()
-                    && !instrument
-                        .instrument_class()
-                        .divides_notional_by_price(instrument.is_inverse())
-            })
+            cache
+                .instrument(instrument_id)
+                .is_some_and(Instrument::allows_negative_price)
         };
         let is_valid = |price: &Price| price.as_decimal() > Decimal::ZERO || allows_non_positive();
         let mark_price = if self.config.use_mark_prices {

@@ -745,7 +745,9 @@ impl HyperliquidHttpClient {
     /// account-wide margin. Otherwise USDC comes from the perp margin summary only when that
     /// summary reflects non-zero collateral, margin used, or withdrawable balance; if the
     /// summary is absent or zeroed, spot USDC is used instead. Non-USDC tokens are always
-    /// appended from the spot balances.
+    /// appended from the spot balances. Spot tokens the venue lists at zero are reported at
+    /// zero, and USDC is reported at zero when there is no USDC balance, so a previous balance
+    /// is cleared. On accounts without spot collateral this needs a perp summary in the response.
     ///
     /// # Errors
     ///
@@ -878,7 +880,7 @@ impl HyperliquidHttpClient {
     /// Split an HIP-4 outcome's quote tokens into matched Yes and No side tokens.
     ///
     /// Submits a `userOutcome` exchange action with the `splitOutcome` operation:
-    /// debits `amount` quote tokens (USDH) and credits `amount` Yes plus `amount`
+    /// debits `amount` quote tokens and credits `amount` Yes plus `amount`
     /// No side tokens for the given `outcome` index. Ordinary directional
     /// buys and sells on outcome instruments go through the standard order path
     /// without calling this; the action is for dual-side market making and

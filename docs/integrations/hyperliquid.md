@@ -307,8 +307,9 @@ The outcome universe cycles. Each settlement removes the resolved outcome
 from `outcomeMeta`, and the venue's next listing advances the index.
 Reconciliation still resolves fills and historical orders on a settled
 outcome: the adapter derives the side token's instrument from its
-`#{encoding}` coin, without the market name, description, or expiry that
-`outcomeMeta` carries. Inspect the live universe with:
+`#{encoding}` coin, without the market name, description, expiry, or quote token that
+`outcomeMeta` carries. See [Settlement currency](#settlement-currency) for the currency fallback.
+Inspect the live universe with:
 
 ```bash
 curl -s -X POST https://api.hyperliquid.xyz/info \
@@ -373,11 +374,12 @@ an empty one.
 #### Reduce-only fill quantity
 
 Hyperliquid can report a reduce-only order as `filled` with nothing remaining once it closes a
-position smaller than the order. During startup mass status the adapter clamps such an order to
-the total of its fills, so it closes `Filled` at a quantity smaller than the size originally
-submitted. The clamp applies only when the `userFills` history is complete and under its
-2,000-record limit. Otherwise the adapter keeps the venue's quantity, and reconciliation can infer
-the missing fill.
+position smaller than the order. During startup mass status, and when it looks up a single order
+by venue order ID, the adapter clamps such an order to the total of its fills, so it closes
+`Filled` at a quantity smaller than the size originally submitted. The clamp applies only when the
+`userFills` history is complete and under its 2,000-record limit. Otherwise the adapter keeps the
+venue's quantity, and reconciliation can infer the missing fill. A single-order lookup fetches
+`userFills` only for a reduce-only order reported `Filled`.
 
 #### Command and direct requests
 
@@ -525,21 +527,24 @@ Values are kept as strings to preserve wire fidelity; numeric identifiers
 
 ### Settlement currency
 
-The adapter denominates every outcome instrument in USDH (token index 360, traded on the
-`USDH/USDC` spot pair `@230`). USDH is registered at 8-decimal precision on first outcome
-instrument creation, so `BinaryOption.currency`, `quote_currency`, and the commission currency
-on zero-fee outcome fills all resolve to USDH. The registration is explicit so the precision is
-deterministic rather than dependent on whichever code path first triggers currency auto-registration.
+The adapter uses each outcome's `outcomeMeta` `quoteToken` for `BinaryOption.currency`,
+`quote_currency`, and settlement currency. Zero-fee fills that report a side token as `feeToken`
+use the instrument's quote currency for commission. When metadata selects USDH, the adapter
+registers it explicitly at 8-decimal precision so currency auto-registration does not determine
+its precision.
+
+When `quoteToken` is missing, the adapter defaults to USDC. Settled outcomes that disappear from
+`outcomeMeta` retain their currency while the instrument remains in the adapter's in-memory cache.
+After a restart, the adapter uses USDC unless the instrument is supplied to that cache again.
+USDC is an adapter compatibility default: mainnet and testnet outcomes observed in October 2026
+quote in USDC. The outcome asset encoding does not identify its quote token, so the adapter
+cannot recover a different historical currency without a cached instrument.
+
+Reconstructed instruments also enter the cache with USDC and retain that currency until a
+supplied instrument replaces them, even if later metadata specifies another quote token.
 
 USDH spot balances merge with the perp clearinghouse view, so `AccountState`
 carries USDH alongside USDC and any other non-zero spot holdings.
-
-:::warning
-Hyperliquid reports the quote token per outcome in the `outcomeMeta` `quoteToken` field, and
-mainnet outcomes currently quote in USDC rather than USDH. The adapter does not yet read that
-field, so outcome instruments loaded from mainnet carry a USDH quote currency that does not match
-the venue. Treat HIP-4 support as testnet-ready until the per-outcome quote token is honored.
-:::
 
 ### Trading flow
 
@@ -565,10 +570,10 @@ from nautilus_trader.adapters.hyperliquid import HyperliquidHttpClient
 
 client = HyperliquidHttpClient.from_env(HyperliquidEnvironment.MAINNET)
 
-# Mint matched Yes + No side tokens from USDH (e.g. dual-side market making)
+# Mint matched Yes + No side tokens from the outcome's quote token
 await client.submit_split_outcome(50, Decimal("1.0"))
 
-# Burn a matched Yes + No pair back to USDH (amount=None merges the max)
+# Burn a matched Yes + No pair back to quote tokens (amount=None merges the max)
 await client.submit_merge_outcome(50, None)
 
 # Multi-outcome priceBucket operations
@@ -604,18 +609,35 @@ so that `order_qty * limit_price >= 10`.
 
 At expiry the venue closes held side-token balances and emits a `Settlement`
 fill per side. The adapter consumes these through the standard user-fills
-stream (HTTP poll and WebSocket); no synthetic dispatch runs.
+stream (HTTP poll and WebSocket), preserving the venue-reported commission.
 
 Each settlement fill:
 
-- `order_side = SELL`, zero commission.
+- `order_side = SELL`.
 - Price `1` quote token for the winning side, `0` for the loser.
 - Surfaces as a `FillReport`.
-- Also emits `OrderFilled` when WebSocket dispatch links the position to a
+- Venue fills also emit `OrderFilled` when WebSocket dispatch links the position to a
   tracked order.
 
-Covers standalone `priceBinary` outcomes and multi-outcome `priceBucket`
+Venue `Settlement` fills cover standalone `priceBinary` outcomes and multi-outcome `priceBucket`
 questions uniformly.
+
+The Rust-only `outcome_settlement_poll_secs` option enables synthetic settlement polling for
+multi-outcome questions. It is disabled by default.
+
+:::warning
+
+Keep synthetic polling disabled and consume venue settlement fills. The inference assumes that a non-empty
+`settledNamedOutcomes` list identifies winning outcomes within `namedOutcomes` and that all other
+named outcomes and the fallback have lost. Testnet metadata observed in October 2026 instead
+lists removed outcomes in `settledNamedOutcomes` while other named outcomes remain listed.
+Under that shape, polling can emit closing fills for positions in markets that are still trading.
+
+:::
+
+Synthetic fills carry zero commission in the cached instrument's quote currency, or the metadata
+quote token when no cached instrument exists, with USDC as the fallback. They have no
+`client_order_id` and are dispatched as `FillReport`s.
 
 ### Position reconciliation
 
@@ -924,19 +946,22 @@ self.subscribe_data(
 Venue snapshot batches set `is_snapshot=True` on every row/fill from that
 batch so consumers can clear and rebuild local TWAP state.
 
-In a Python strategy running inside a `LiveNode`, the payload is delivered
-to `on_data` as the concrete custom data type itself:
+In a Python strategy running inside a `LiveNode`, `on_data` receives the
+payload wrapped in `CustomData`. Read it from `CustomData.data` and check its
+type with `isinstance`:
 
 ```python
 from decimal import Decimal
 
 from nautilus_trader.adapters.hyperliquid import HyperliquidOpenInterest
+from nautilus_trader.model import CustomData
 
 
-def on_data(self, data) -> None:
-    if isinstance(data, HyperliquidOpenInterest):
-        if data.open_interest > Decimal("1000"):
-            self.log.info(f"OI {data.instrument_id} -> {data.open_interest}")
+def on_data(self, data: CustomData) -> None:
+    payload = data.data
+    if isinstance(payload, HyperliquidOpenInterest):
+        if payload.open_interest > Decimal("1000"):
+            self.log.info(f"OI {payload.instrument_id} -> {payload.open_interest}")
 ```
 
 `HyperliquidAllDexsAssetCtxs` exposes a whole-feed aggregate rather than one
@@ -1268,14 +1293,23 @@ for a leg older than the bound one, such as a replay after a reconnect, never mo
 back.
 
 The same chain guards the inflight query and single-order reconcile paths. While a modify is in
-flight, `query_order` and `generate_order_status_report` drop a `Canceled` for the superseded leg,
-so an out-of-band status probe that resolves the old `oid` before the replacement appears cannot
-terminate the live order. A non-cancel status for the old leg (such as a late `Filled`) is still
-forwarded so reconciliation can recover it.
+flight, `query_order` drops a `Canceled` for the superseded leg. `generate_order_status_report`
+returns an error for that report so reconciliation defers resolution rather than treating it as
+proof of absence. A modify whose venue outcome is unknown keeps its intent, so the old-leg cancel
+stays deferred until that intent clears. These cancel guards prevent a status probe for the old
+leg from terminating the live order.
+
+`generate_order_status_report` also defers `Accepted` and `Triggered` reports whenever their `oid`
+is older than the bound one, including when no modify is pending. These checks keep single-order
+reconciliation from applying an older leg's state or promoting the binding back to that leg.
+After promotion, `Canceled` reports for historical legs reach shared reconciliation, which
+suppresses the old cancellation while recovering missing fills. Late `Filled` reports also remain
+available for recovery.
 
 #### Dropped replacement acceptance
 
-These paths also promote the replacement. Hyperliquid lists the replacement under the same `cloid`
+The inflight query and single-order reconcile paths also promote the replacement. Hyperliquid
+lists the replacement under the same `cloid`
 with a new `oid` in `frontendOpenOrders`, so when the replacement `ACCEPTED(new_oid)` was dropped
 on the WebSocket and no fill has arrived, the query resolves it by `cloid` and promotes it to
 `OrderUpdated` directly (rebinding the `cloid` to `new_oid` and advancing the modify chain).
@@ -1402,6 +1436,11 @@ come from `spotClearinghouseState`. USDC comes from the perp summary when it ref
 non-zero collateral, margin, or withdrawable balance; when the perp summary is absent or
 zeroed, spot USDC is used instead. A mode the adapter does not recognize is logged as a
 warning and handled the same way.
+
+Spot tokens that `spotClearinghouseState` lists at zero are reported at zero, so a sold-out or
+withdrawn token clears its previous balance. USDC is reported at zero when the account has no USDC
+balance. Outside unified and portfolio margin both need a perp summary in the response; without one
+the previous balances are kept.
 
 If the account mode cannot be fetched or read, the account state request fails, and so
 does connect.

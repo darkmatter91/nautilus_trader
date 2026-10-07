@@ -34,19 +34,6 @@ use ustr::Ustr;
 use super::settlement::SettlementRegistry;
 use crate::common::consts::DUST_SNAP_THRESHOLD_DEC;
 
-/// Cumulative fill state for a single venue order.
-///
-/// A modified order continues on a replacement venue order, so `prior_qty` holds the order
-/// quantity carried by earlier venue orders, and the order quantity is `prior_qty` plus
-/// `submitted_qty`.
-#[derive(Debug, Clone, Copy)]
-struct OrderFillState {
-    submitted_qty: Quantity,
-    prior_qty: Quantity,
-    cumulative_filled: Quantity,
-    order_side: OrderSide,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct FillCorrectionMetadata {
     pub venue_trade_id: String,
@@ -67,19 +54,6 @@ impl BufferedFill {
             settlement.claim_buffered_fill(&correction.venue_trade_id, &self.report.trade_id)
         })
     }
-}
-
-/// Registration map plus the fill and order-report buffers, all under one mutex.
-///
-/// Co-locating the buffers with the registration map is what closes the buffer-after-drain race:
-/// the WS dispatch's accepted-check and buffer, and the submit path's register and drain, are all
-/// single critical sections on this one lock, so a buffer can never slip between a register and the
-/// drain that follows it.
-#[derive(Debug, Default)]
-struct TrackerInner {
-    orders: AHashMap<VenueOrderId, OrderFillState>,
-    pending_fills: FifoCacheMap<VenueOrderId, Vec<BufferedFill>, 1_000>,
-    pending_reports: FifoCacheMap<VenueOrderId, Vec<OrderStatusReport>, 1_000>,
 }
 
 /// Tracks per-order fill accumulation, detects dust residuals, and buffers WS messages that arrive
@@ -105,10 +79,11 @@ impl OrderFillTrackerMap {
         venue_order_id: VenueOrderId,
         submitted_qty: Quantity,
         prior_qty: Quantity,
+        prior_filled: Quantity,
         filled_qty: Quantity,
         order_side: OrderSide,
     ) {
-        let mut state = new_order_state(submitted_qty, prior_qty, order_side);
+        let mut state = new_order_state(submitted_qty, prior_qty, prior_filled, order_side);
         state.cumulative_filled = filled_qty;
         self.inner.lock().orders.insert(venue_order_id, state);
     }
@@ -203,13 +178,14 @@ impl OrderFillTrackerMap {
         client_order_id: Option<ClientOrderId>,
         submitted_qty: Quantity,
         prior_qty: Quantity,
+        prior_filled: Quantity,
         order_side: OrderSide,
     ) -> Vec<BufferedFill> {
         let mut guard = self.inner.lock();
         guard
             .orders
             .entry(venue_order_id)
-            .or_insert_with(|| new_order_state(submitted_qty, prior_qty, order_side));
+            .or_insert_with(|| new_order_state(submitted_qty, prior_qty, prior_filled, order_side));
         take_and_prepare_fills(&mut guard, venue_order_id, client_order_id)
     }
 
@@ -230,11 +206,8 @@ impl OrderFillTrackerMap {
         }
 
         guard.orders.entry(venue_order_id).or_insert_with(|| {
-            new_order_state(
-                submitted_qty,
-                Quantity::zero(submitted_qty.precision),
-                order_side,
-            )
+            let zero = Quantity::zero(submitted_qty.precision);
+            new_order_state(submitted_qty, zero, zero, order_side)
         });
 
         Some(take_and_prepare_fills(
@@ -321,8 +294,9 @@ impl OrderFillTrackerMap {
     /// sub-cent-share leaves.
     ///
     /// The returned quantity is used for an order-only reconciliation update. It is not a fill and
-    /// must not change positions, balances, or commissions. The entry is removed on normalization
-    /// so repeated terminal messages are idempotent.
+    /// must not change positions, balances, or commissions. It equals the order's filled quantity,
+    /// without earlier venue orders' non-reopened voided quantity, so the update closes the order.
+    /// The entry is removed on normalization so repeated terminal messages are idempotent.
     pub(crate) fn check_terminal_quantity_normalization(
         &self,
         venue_order_id: &VenueOrderId,
@@ -335,7 +309,7 @@ impl OrderFillTrackerMap {
         let leaves = s.submitted_qty.as_decimal() - s.cumulative_filled.as_decimal();
 
         if leaves > Decimal::ZERO && leaves < DUST_SNAP_THRESHOLD_DEC {
-            let filled_qty = s.prior_qty + s.cumulative_filled;
+            let filled_qty = s.prior_filled + s.cumulative_filled;
 
             log::debug!(
                 "Normalizing terminal order {venue_order_id} quantity from {} to {filled_qty} \
@@ -378,14 +352,44 @@ impl OrderFillTrackerMap {
     }
 }
 
+/// Cumulative fill state for a single venue order.
+///
+/// A modified order continues on a replacement venue order, so `prior_qty` holds the order
+/// quantity carried by earlier venue orders, and the order quantity is `prior_qty` plus
+/// `submitted_qty`. `prior_filled` is the part of `prior_qty` they filled, without their
+/// non-reopened voided quantity.
+#[derive(Debug, Clone, Copy)]
+struct OrderFillState {
+    submitted_qty: Quantity,
+    prior_qty: Quantity,
+    prior_filled: Quantity,
+    cumulative_filled: Quantity,
+    order_side: OrderSide,
+}
+
+/// Registration map plus the fill and order-report buffers, all under one mutex.
+///
+/// Co-locating the buffers with the registration map is what closes the buffer-after-drain race:
+/// the WS dispatch's accepted-check and buffer, and the submit path's register and drain, are all
+/// single critical sections on this one lock, so a buffer can never slip between a register and the
+/// drain that follows it.
+#[derive(Debug, Default)]
+struct TrackerInner {
+    orders: AHashMap<VenueOrderId, OrderFillState>,
+    pending_fills: FifoCacheMap<VenueOrderId, Vec<BufferedFill>, 1_000>,
+    pending_reports: FifoCacheMap<VenueOrderId, Vec<OrderStatusReport>, 1_000>,
+}
+
 fn new_order_state(
     submitted_qty: Quantity,
     prior_qty: Quantity,
+    prior_filled: Quantity,
     order_side: OrderSide,
 ) -> OrderFillState {
     OrderFillState {
         submitted_qty,
         prior_qty,
+        prior_filled,
         cumulative_filled: Quantity::zero(submitted_qty.precision),
         order_side,
     }
@@ -452,13 +456,10 @@ impl OrderFillTrackerMap {
         _size_precision: u8,
         _price_precision: u8,
     ) {
+        let zero = Quantity::zero(submitted_qty.precision);
         self.inner.lock().orders.insert(
             venue_order_id,
-            new_order_state(
-                submitted_qty,
-                Quantity::zero(submitted_qty.precision),
-                order_side,
-            ),
+            new_order_state(submitted_qty, zero, zero, order_side),
         );
     }
 
@@ -469,6 +470,15 @@ impl OrderFillTrackerMap {
             .orders
             .get(venue_order_id)
             .map(|s| s.submitted_qty)
+    }
+
+    /// Returns the quantity earlier venue orders filled, if tracked.
+    pub(crate) fn prior_filled(&self, venue_order_id: &VenueOrderId) -> Option<Quantity> {
+        self.inner
+            .lock()
+            .orders
+            .get(venue_order_id)
+            .map(|s| s.prior_filled)
     }
 
     /// Records a fill against a registered order, for tests that drive fill accumulation directly.
@@ -574,6 +584,7 @@ mod tests {
             None,
             Quantity::from("100"),
             Quantity::zero(Quantity::from("100").precision),
+            Quantity::zero(Quantity::from("100").precision),
             OrderSide::Buy,
         );
         tracker.record_fill(&venue_order_id, Quantity::from("25"));
@@ -581,6 +592,7 @@ mod tests {
             venue_order_id,
             None,
             Quantity::from("100"),
+            Quantity::zero(Quantity::from("100").precision),
             Quantity::zero(Quantity::from("100").precision),
             OrderSide::Buy,
         );
@@ -686,6 +698,7 @@ mod tests {
             Some(ClientOrderId::from("O-FAILED-BEFORE-DRAIN")),
             Quantity::new(10.0, 6),
             Quantity::zero(Quantity::new(10.0, 6).precision),
+            Quantity::zero(Quantity::new(10.0, 6).precision),
             OrderSide::Buy,
         );
         let buffered = &drained[0];
@@ -750,6 +763,75 @@ mod tests {
         let normalized = tracker.check_terminal_quantity_normalization(&vid);
 
         assert_eq!(normalized, Some(Quantity::new(99.997714, 6)));
+    }
+
+    #[rstest]
+    #[case::missing(None, true)]
+    #[case::registered_empty(Some("0.000000"), false)]
+    #[case::partial(Some("25.123456"), true)]
+    #[case::fully_filled(Some("100.000000"), true)]
+    fn test_has_fills_or_settled(#[case] filled: Option<&str>, #[case] expected: bool) {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("V-FILL-STATUS");
+
+        if let Some(filled) = filled {
+            tracker.restore_order(
+                venue_order_id,
+                Quantity::from("100.000000"),
+                Quantity::from("13.000000"),
+                Quantity::from("13.000000"),
+                Quantity::from(filled),
+                OrderSide::Buy,
+            );
+        }
+
+        let result = tracker.has_fills_or_settled(&venue_order_id);
+
+        assert_eq!(result, expected);
+        assert_eq!(
+            tracker.get_cumulative_filled(&venue_order_id),
+            filled.map(Quantity::from)
+        );
+    }
+
+    #[rstest]
+    #[case::partial(true, "7.000001", Some("18.123455"))]
+    #[case::exact(true, "25.123456", Some("0.000000"))]
+    #[case::excess(true, "30.000000", Some("0.000000"))]
+    #[case::zero(true, "0.000000", Some("25.123456"))]
+    #[case::missing(false, "7.000001", None)]
+    fn test_reverse_fill_preserves_remaining_quantity(
+        #[case] registered: bool,
+        #[case] reversed: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let tracker = OrderFillTrackerMap::new();
+        let venue_order_id = VenueOrderId::from("V-FILL-REVERSAL");
+
+        if registered {
+            tracker.restore_order(
+                venue_order_id,
+                Quantity::from("100.000000"),
+                Quantity::from("13.000000"),
+                Quantity::from("13.000000"),
+                Quantity::from("25.123456"),
+                OrderSide::Buy,
+            );
+        }
+
+        tracker.reverse_fill(&venue_order_id, Quantity::from(reversed));
+
+        let remaining = tracker.get_cumulative_filled(&venue_order_id);
+        assert_eq!(remaining, expected.map(Quantity::from));
+        assert_eq!(
+            remaining.map(|quantity| quantity.precision),
+            expected.map(|_| 6)
+        );
+        assert_eq!(tracker.contains(&venue_order_id), registered);
+        assert_eq!(
+            tracker.submitted_qty(&venue_order_id),
+            registered.then(|| Quantity::from("100.000000"))
+        );
     }
 
     #[rstest]
@@ -1072,6 +1154,7 @@ mod tests {
                 None,
                 Quantity::from("15.000000"),
                 Quantity::from("5.000000"),
+                Quantity::from("5.000000"),
                 OrderSide::Buy,
             );
         }
@@ -1139,12 +1222,12 @@ mod tests {
             order_side: OrderSide::Buy,
             last_qty: Quantity::from("714.285714"),
             last_px: Price::from("0.014"),
-            commission: Money::zero(pusd()),
+            commission: Money::from("0.12345 pUSD"),
             liquidity_side: LiquiditySide::Taker,
             avg_px: None,
             report_id: UUID4::new(),
-            ts_event: UnixNanos::default(),
-            ts_init: UnixNanos::default(),
+            ts_event: UnixNanos::from(12_345_678u64),
+            ts_init: UnixNanos::from(93_456_789u64),
             client_order_id: None,
             venue_position_id: None,
         };
@@ -1155,6 +1238,7 @@ mod tests {
             venue_order_id,
             Some(ClientOrderId::from("O-BUFFERED-OVERFILL")),
             Quantity::from("714.285710"),
+            Quantity::zero(Quantity::from("714.285710").precision),
             Quantity::zero(Quantity::from("714.285710").precision),
             OrderSide::Buy,
         );
@@ -1189,7 +1273,14 @@ mod tests {
         );
 
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].report.last_qty, Quantity::from("714.285714"));
+
+        let expected_report = FillReport {
+            client_order_id: Some(ClientOrderId::from("O-BUFFERED-OVERFILL")),
+            ..report
+        };
+
+        assert_eq!(drained[0].report, expected_report);
+        assert!(drained[0].correction.is_none());
         assert!(emitted);
         assert_eq!(
             emitted_qty.get(),
