@@ -13,19 +13,24 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::sync::Arc;
+
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
-use nautilus_common::messages::execution::{
-    GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-    GeneratePositionStatusReports, QueryAccount, QueryOrder,
+use nautilus_common::{
+    clients::ExecutionReportTask,
+    messages::execution::{
+        GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+        GeneratePositionStatusReports, QueryAccount, QueryOrder,
+    },
 };
 use nautilus_core::{
     UnixNanos, collections::AtomicMap, string::secret::SecretString, time::AtomicTime,
 };
-use nautilus_live::{ExecutionEventEmitter, execution::context::OrderContext};
+use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
-    identifiers::{ClientOrderId, InstrumentId, TradeId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -37,6 +42,9 @@ use ustr::Ustr;
 
 use super::{
     PolymarketExecutionClient,
+    context::OrderContextRegistry,
+    fill_report_gate,
+    fill_tracker::OrderFillTrackerMap,
     parse::{
         parse_balance_allowance, recovered_terminal_order_status, sum_filled_quantity,
         weighted_average_price,
@@ -48,15 +56,23 @@ use super::{
         cap_order_report_filled_qty, normalize_terminal_order_report_quantity,
         venue_leg_filled_before_and_quantity, venue_qty_matches,
     },
+    report_gate,
     responses::confirm_modify_replacement,
+    settlement::SettlementRegistry,
 };
 use crate::{
-    common::enums::{PolymarketSignatureType, PolymarketSignerType},
+    common::{
+        credential::Credential,
+        enums::{PolymarketSignatureType, PolymarketSignerType},
+    },
     http::{
         clob::PolymarketClobHttpClient,
+        data_api::PolymarketDataApiHttpClient,
         query::{GetBalanceAllowanceParams, GetTradesParams},
     },
-    websocket::dispatch::{WsDispatchContext, apply_uncertain_order_evidence},
+    websocket::dispatch::{
+        ModifyPromotion, WsDispatchContext, WsDispatchState, apply_uncertain_order_evidence,
+    },
 };
 
 #[derive(Clone)]
@@ -204,169 +220,6 @@ impl PolymarketExecutionClient {
                 .or_else(|| cached_order.as_ref().map(|order| order.order_side())),
             cached_order,
         })
-    }
-
-    async fn recover_terminal_status_from_trades(
-        &self,
-        venue_order_id: VenueOrderId,
-        instrument_id: InstrumentId,
-        authority: TargetOrderAuthority,
-        size_prec: u8,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
-        let ts_init = self.clock.get_time_ns();
-        let ctx = self.fill_context();
-
-        let trades = self
-            .http_client
-            .get_trades(GetTradesParams::default())
-            .await
-            .context("failed to fetch trades for order recovery")?;
-
-        let resolved_client_order_id = authority.client_order_id;
-        let cached = authority.cached_order;
-        let cached_quantity = cached.as_ref().map(Order::quantity);
-        let cached_order_type = cached.as_ref().map_or(OrderType::Limit, Order::order_type);
-        let cached_tif = cached
-            .as_ref()
-            .map_or(TimeInForce::Gtc, Order::time_in_force);
-        let cached_price = cached.as_ref().and_then(Order::price);
-        let cached_side = cached.as_ref().map(|order| order.order_side());
-        let expected_order_side = authority.order_side;
-
-        let (order_fills, fill_discards) = build_fill_reports_from_trades(
-            &trades,
-            &ctx,
-            &self.shared_token_instruments,
-            FillReportScope::new(Some(instrument_id), Some(venue_order_id))
-                .with_expected_order_side(expected_order_side),
-            ts_init,
-            self.config.reconciliation_load_ids(),
-            None,
-        )?;
-
-        if fill_discards.has_pending_target {
-            let Some(cached) = cached.as_ref() else {
-                log::debug!(
-                    "Order {venue_order_id} has unsettled trades but no cached order; deferring recovery"
-                );
-                return Ok(None);
-            };
-            let order_status = if cached.filled_qty().is_zero() {
-                OrderStatus::Accepted
-            } else {
-                OrderStatus::PartiallyFilled
-            };
-            let mut report = OrderStatusReport::new(
-                self.core.account_id,
-                instrument_id,
-                resolved_client_order_id,
-                venue_order_id,
-                cached.order_side().into(),
-                cached.order_type(),
-                cached.time_in_force(),
-                order_status,
-                cached.quantity(),
-                cached.filled_qty(),
-                ts_init,
-                ts_init,
-                ts_init,
-                None,
-            );
-            report.price = cached_price;
-
-            log::debug!(
-                "Order {venue_order_id} has unsettled trades; reporting non-terminal {order_status}"
-            );
-            return Ok(Some(report));
-        }
-
-        if order_fills.is_empty() {
-            let Some(cached) = cached.as_ref() else {
-                log::debug!(
-                    "Order {venue_order_id} not active at venue, no trades found, and no cached order; nothing to recover"
-                );
-                return Ok(None);
-            };
-
-            if cached.ts_accepted().is_none() {
-                return Ok(None);
-            }
-
-            log::debug!(
-                "Order {venue_order_id} not active at venue and no trades found; recovering as Canceled"
-            );
-            let mut report = OrderStatusReport::new(
-                self.core.account_id,
-                instrument_id,
-                resolved_client_order_id,
-                venue_order_id,
-                cached.order_side().into(),
-                cached.order_type(),
-                cached.time_in_force(),
-                OrderStatus::Canceled,
-                cached.quantity(),
-                cached.filled_qty(),
-                ts_init,
-                ts_init,
-                ts_init,
-                None,
-            );
-            report.price = cached_price;
-            report.cancel_reason = Some("ORDER_NOT_FOUND_AT_VENUE".to_string());
-            return Ok(Some(report));
-        }
-
-        let Some(quantity) = cached_quantity else {
-            log::debug!(
-                "Order {venue_order_id} has trades but no cached order; deferring to engine"
-            );
-            return Ok(None);
-        };
-
-        let total_filled_dec = sum_filled_quantity(&order_fills);
-        let avg_px = weighted_average_price(&order_fills, total_filled_dec);
-        let raw_filled_qty = Quantity::from_decimal_dp(total_filled_dec, size_prec)?;
-        let order_side = cached_side.unwrap_or(order_fills[0].order_side);
-        let ts_event = order_fills
-            .iter()
-            .map(|f| f.ts_event)
-            .max()
-            .unwrap_or(ts_init);
-
-        let order_status = recovered_terminal_order_status(cached_tif, quantity, raw_filled_qty);
-        let filled_qty = raw_filled_qty;
-
-        log::debug!(
-            "Recovered {} status for {venue_order_id} from {} trade(s) (filled_qty={filled_qty}, quantity={quantity})",
-            if order_status == OrderStatus::Filled {
-                "Filled"
-            } else {
-                "Canceled (partially filled)"
-            },
-            order_fills.len(),
-        );
-
-        let mut report = OrderStatusReport::new(
-            self.core.account_id,
-            instrument_id,
-            resolved_client_order_id,
-            venue_order_id,
-            order_side.into(),
-            cached_order_type,
-            cached_tif,
-            order_status,
-            quantity,
-            filled_qty,
-            ts_event,
-            ts_event,
-            ts_init,
-            None,
-        );
-        report.price = cached_price;
-        report.avg_px = avg_px;
-        normalize_terminal_order_report_quantity(&mut report, Quantity::zero(size_prec));
-
-        Ok(Some(report))
     }
 
     pub(super) fn query_account_command(&self, _cmd: QueryAccount) {
@@ -594,10 +447,148 @@ impl PolymarketExecutionClient {
         });
     }
 
-    pub(super) async fn generate_order_status_report_impl(
+    pub(super) fn order_status_report_task(
         &self,
         cmd: &GenerateOrderStatusReport,
-    ) -> anyhow::Result<Option<OrderStatusReport>> {
+    ) -> ExecutionReportTask<Option<OrderStatusReport>> {
+        let gate = report_gate(&self.settlement, cmd.instrument_id, "order status report");
+        let target = gate().and_then(|()| self.order_report_target(cmd));
+        let client = self.report_client();
+        let ws_dispatch_state = Arc::clone(&self.ws_dispatch_state);
+        ExecutionReportTask::new(
+            async move {
+                let target = target?;
+                let venue_order_id = target.venue_order_id;
+                let report = Box::pin(client.collect_order_status_report(target)).await?;
+                Ok((venue_order_id, report))
+            },
+            move |(venue_order_id, report)| {
+                let report = finish_order_status_report(report, venue_order_id, &ws_dispatch_state);
+                gate()?;
+                Ok(report)
+            },
+        )
+    }
+
+    pub(super) fn order_status_reports_task(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> ExecutionReportTask<Vec<OrderStatusReport>> {
+        let gate = report_gate(&self.settlement, cmd.instrument_id, "order status reports");
+        let ready = gate();
+        let cached_filled = self.cached_filled_quantities();
+        let client = self.report_client();
+        let finisher = self.order_reports_finisher();
+        let command = cmd.clone();
+        let collection_command = cmd.clone();
+        ExecutionReportTask::new(
+            async move {
+                ready?;
+                client
+                    .collect_order_status_reports(&collection_command, Some(&cached_filled))
+                    .await
+            },
+            move |mut collected: CollectedOrderReports| {
+                let modify_fill_offsets = finisher.promote_replacements(&mut collected.reports)?;
+                let needs_confirmed_fills = finisher.needs_confirmed_fills(&collected.reports);
+                let reports = finisher.finish(
+                    collected.reports,
+                    &modify_fill_offsets,
+                    needs_confirmed_fills,
+                    collected.confirmed_fills,
+                    &command,
+                )?;
+                gate()?;
+                Ok(reports)
+            },
+        )
+    }
+
+    pub(super) fn fill_reports_task(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> ExecutionReportTask<Vec<FillReport>> {
+        let gate = fill_report_gate(&self.settlement, cmd);
+        let ready = gate();
+        let authority = self.fill_report_authority(cmd);
+        let client = self.report_client();
+        let command = cmd.clone();
+        ExecutionReportTask::new(
+            async move {
+                ready?;
+                client.collect_fill_reports(command, authority).await
+            },
+            move |reports| {
+                gate()?;
+                Ok(reports)
+            },
+        )
+    }
+
+    pub(super) fn position_status_reports_task(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> ExecutionReportTask<Vec<PositionStatusReport>> {
+        let gate = report_gate(
+            &self.settlement,
+            cmd.instrument_id,
+            "position status reports",
+        );
+        let ready = gate();
+        let resolved_balances = self.resolved_balance_scope();
+        let client = self.report_client();
+        let command = cmd.clone();
+        ExecutionReportTask::new(
+            async move {
+                ready?;
+                client
+                    .collect_position_status_reports(&command, resolved_balances)
+                    .await
+            },
+            move |reports| {
+                gate()?;
+                Ok(reports)
+            },
+        )
+    }
+
+    fn report_client(&self) -> PolymarketReportClient {
+        PolymarketReportClient {
+            http_client: self.http_client.clone(),
+            data_api_client: self.data_api_client.clone(),
+            shared_token_instruments: Arc::clone(&self.shared_token_instruments),
+            settlement: Arc::clone(&self.settlement),
+            ws_dispatch_state: Arc::clone(&self.ws_dispatch_state),
+            clock: self.clock,
+            account_id: self.core.account_id,
+            signer_type: self.config.signer_type,
+            user_address: self
+                .secrets
+                .funder
+                .clone()
+                .unwrap_or_else(|| self.secrets.address.clone()),
+            credential: self.secrets.credential.clone(),
+            load_ids: self.config.reconciliation_load_ids().map(<[_]>::to_vec),
+        }
+    }
+
+    fn order_reports_finisher(&self) -> OrderReportsFinisher {
+        OrderReportsFinisher {
+            core: self.core.clone(),
+            emitter: self.emitter.clone(),
+            clock: self.clock,
+            fill_tracker: Arc::clone(&self.fill_tracker),
+            settlement: Arc::clone(&self.settlement),
+            order_contexts: Arc::clone(&self.order_contexts),
+            ws_dispatch_state: Arc::clone(&self.ws_dispatch_state),
+        }
+    }
+
+    /// Resolves the single-order report target from current core-thread state.
+    fn order_report_target(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<OrderReportTarget> {
         let Some(venue_order_id) =
             self.resolve_venue_order_id(cmd.venue_order_id, cmd.client_order_id)
         else {
@@ -623,7 +614,237 @@ impl PolymarketExecutionClient {
             .instrument(&instrument_id)
             .cloned()
             .with_context(|| format!("instrument {instrument_id} not cached"))?;
-        let size_prec = instrument.size_precision();
+
+        Ok(OrderReportTarget {
+            venue_order_id,
+            instrument_id,
+            authority,
+            cached_authority,
+            size_prec: instrument.size_precision(),
+        })
+    }
+
+    /// Resolves the fill report target authority from current core-thread state.
+    fn fill_report_authority(
+        &self,
+        cmd: &GenerateFillReports,
+    ) -> anyhow::Result<Option<TargetOrderAuthority>> {
+        cmd.venue_order_id
+            .map(|venue_order_id| {
+                self.resolve_target_order_authority(None, venue_order_id, cmd.instrument_id)
+            })
+            .transpose()
+    }
+
+    /// Snapshots cached filled quantities used to decide whether a worker collects confirmed fills.
+    fn cached_filled_quantities(&self) -> AHashMap<ClientOrderId, Quantity> {
+        self.core
+            .cache()
+            .orders(Some(&self.core.venue), None, None, None, None)
+            .iter()
+            .map(|order| (order.client_order_id(), order.filled_qty()))
+            .collect()
+    }
+
+    pub(super) async fn generate_order_status_report_impl(
+        &self,
+        cmd: &GenerateOrderStatusReport,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let target = self.order_report_target(cmd)?;
+        let venue_order_id = target.venue_order_id;
+        let client = self.report_client();
+        let report = Box::pin(client.collect_order_status_report(target)).await?;
+        Ok(finish_order_status_report(
+            report,
+            venue_order_id,
+            &self.ws_dispatch_state,
+        ))
+    }
+
+    fn resolve_venue_order_id(
+        &self,
+        venue_order_id: Option<VenueOrderId>,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Option<VenueOrderId> {
+        venue_order_id
+            .or_else(|| client_order_id.and_then(|id| self.order_contexts.venue_order_id(&id)))
+            .or_else(|| {
+                client_order_id.and_then(|id| {
+                    self.core
+                        .cache()
+                        .order(&id)
+                        .and_then(|order| order.venue_order_id())
+                })
+            })
+            .or_else(|| client_order_id.and_then(|id| self.pending_submits.venue_order_id(id)))
+    }
+
+    pub(super) async fn generate_order_status_reports_impl(
+        &self,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let client = self.report_client();
+        let mut collected = client.collect_order_status_reports(cmd, None).await?;
+        let finisher = self.order_reports_finisher();
+        let modify_fill_offsets = finisher.promote_replacements(&mut collected.reports)?;
+        let needs_confirmed_fills = finisher.needs_confirmed_fills(&collected.reports);
+        let confirmed_fills = if needs_confirmed_fills {
+            Some(client.collect_confirmed_fills(cmd).await)
+        } else {
+            None
+        };
+
+        finisher.finish(
+            collected.reports,
+            &modify_fill_offsets,
+            needs_confirmed_fills,
+            confirmed_fills,
+            cmd,
+        )
+    }
+
+    pub(super) async fn generate_fill_reports_impl(
+        &self,
+        cmd: GenerateFillReports,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let authority = self.fill_report_authority(&cmd);
+        self.report_client()
+            .collect_fill_reports(cmd, authority)
+            .await
+    }
+
+    pub(super) async fn generate_position_status_reports_impl(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        self.report_client()
+            .collect_position_status_reports(cmd, self.resolved_balance_scope())
+            .await
+    }
+
+    pub(super) async fn generate_mass_status_impl(
+        &self,
+        lookback_mins: Option<u64>,
+    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
+        let ctx = self.fill_context();
+
+        let (cached_venue_order_ids, retained_trade_ids) = {
+            let cache = self.core.cache();
+
+            // A reloaded cache indexes only each order's current venue order, not its earlier legs
+            let cached_venue_order_ids: AHashSet<VenueOrderId> = cache
+                .orders(Some(&self.core.venue), None, None, None, None)
+                .iter()
+                .flat_map(|order| order.events())
+                .filter_map(|event| event.venue_order_id())
+                .collect();
+            let mut retained_trade_ids: AHashMap<InstrumentId, AHashSet<TradeId>> = AHashMap::new();
+
+            for position in cache.positions_open(
+                Some(&self.core.venue),
+                None,
+                None,
+                Some(&self.core.account_id),
+                None,
+            ) {
+                retained_trade_ids
+                    .entry(position.instrument_id)
+                    .or_default()
+                    .extend(position.trade_ids.iter().copied());
+            }
+
+            (cached_venue_order_ids, retained_trade_ids)
+        };
+
+        super::reconciliation::generate_mass_status(
+            &self.http_client,
+            &self.data_api_client,
+            &self.shared_token_instruments,
+            &ctx,
+            &self.core,
+            lookback_mins,
+            self.config.reconciliation_load_ids(),
+            &self.resolved_balance_scope(),
+            &retained_trade_ids,
+            |venue_order_id| cached_venue_order_ids.contains(venue_order_id),
+        )
+        .await
+    }
+
+    fn resolved_balance_scope(&self) -> ResolvedBalanceScope {
+        ResolvedBalanceScope::from_cache(&self.core.cache(), self.core.venue, self.core.account_id)
+    }
+}
+
+/// Single-order report target resolved from core-thread state before collection.
+struct OrderReportTarget {
+    venue_order_id: VenueOrderId,
+    instrument_id: InstrumentId,
+    authority: TargetOrderAuthority,
+    cached_authority: Option<OrderAny>,
+    size_prec: u8,
+}
+
+/// Bulk order reports collected without the live cache.
+struct CollectedOrderReports {
+    reports: Vec<OrderStatusReport>,
+    confirmed_fills: Option<ConfirmedFills>,
+}
+
+/// Confirmed fills collected for the open-order filled-quantity check.
+enum ConfirmedFills {
+    Fetched(anyhow::Result<Vec<FillReport>>),
+    Unavailable(String),
+}
+
+/// Owned report collection for worker tasks and the inline report methods.
+///
+/// Holds no live cache or `Rc` state, so collection can run on a runtime worker. Cache-dependent
+/// inputs are resolved on the core thread before collection, and cache-dependent finishing runs
+/// on the core thread afterwards.
+#[derive(Clone)]
+struct PolymarketReportClient {
+    http_client: PolymarketClobHttpClient,
+    data_api_client: PolymarketDataApiHttpClient,
+    shared_token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
+    settlement: Arc<SettlementRegistry>,
+    ws_dispatch_state: Arc<Mutex<WsDispatchState>>,
+    clock: &'static AtomicTime,
+    account_id: AccountId,
+    signer_type: PolymarketSignerType,
+    user_address: String,
+    credential: Credential,
+    load_ids: Option<Vec<InstrumentId>>,
+}
+
+impl PolymarketReportClient {
+    fn fill_context(&self) -> FillContext<'_> {
+        FillContext {
+            signer_type: self.signer_type,
+            account_id: self.account_id,
+            user_address: &self.user_address,
+            api_key: self.credential.api_key_str(),
+            pusd: get_pusd_currency(),
+            clock: self.clock,
+            settlement: self.settlement.clone(),
+        }
+    }
+
+    fn load_ids(&self) -> Option<&[InstrumentId]> {
+        self.load_ids.as_deref()
+    }
+
+    async fn collect_order_status_report(
+        &self,
+        target: OrderReportTarget,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let OrderReportTarget {
+            venue_order_id,
+            instrument_id,
+            authority,
+            cached_authority,
+            size_prec,
+        } = target;
 
         let order = self
             .http_client
@@ -668,7 +889,7 @@ impl PolymarketExecutionClient {
                     FillReportScope::new(Some(instrument_id), Some(venue_order_id))
                         .with_expected_order_side(report.order_side),
                     self.clock.get_time_ns(),
-                    self.config.reconciliation_load_ids(),
+                    self.load_ids(),
                 )
                 .await?
                 .as_deref()
@@ -711,40 +932,189 @@ impl PolymarketExecutionClient {
             report
         };
 
-        if report.order_status == OrderStatus::Canceled
-            && self
-                .ws_dispatch_state
-                .lock()
-                .suppress_modify_cancel_reemit(venue_order_id)
-        {
-            return Ok(None);
+        Ok(Some(report))
+    }
+
+    async fn recover_terminal_status_from_trades(
+        &self,
+        venue_order_id: VenueOrderId,
+        instrument_id: InstrumentId,
+        authority: TargetOrderAuthority,
+        size_prec: u8,
+    ) -> anyhow::Result<Option<OrderStatusReport>> {
+        let ts_init = self.clock.get_time_ns();
+        let ctx = self.fill_context();
+
+        let trades = self
+            .http_client
+            .get_trades(GetTradesParams::default())
+            .await
+            .context("failed to fetch trades for order recovery")?;
+
+        let resolved_client_order_id = authority.client_order_id;
+        let cached = authority.cached_order;
+        let cached_quantity = cached.as_ref().map(Order::quantity);
+        let cached_order_type = cached.as_ref().map_or(OrderType::Limit, Order::order_type);
+        let cached_tif = cached
+            .as_ref()
+            .map_or(TimeInForce::Gtc, Order::time_in_force);
+        let cached_price = cached.as_ref().and_then(Order::price);
+        let cached_side = cached.as_ref().map(|order| order.order_side());
+        let expected_order_side = authority.order_side;
+
+        let (order_fills, fill_discards) = build_fill_reports_from_trades(
+            &trades,
+            &ctx,
+            &self.shared_token_instruments,
+            FillReportScope::new(Some(instrument_id), Some(venue_order_id))
+                .with_expected_order_side(expected_order_side),
+            ts_init,
+            self.load_ids(),
+            None,
+        )?;
+
+        if fill_discards.has_pending_target {
+            let Some(cached) = cached.as_ref() else {
+                log::debug!(
+                    "Order {venue_order_id} has unsettled trades but no cached order; deferring recovery"
+                );
+                return Ok(None);
+            };
+            let order_status = if cached.filled_qty().is_zero() {
+                OrderStatus::Accepted
+            } else {
+                OrderStatus::PartiallyFilled
+            };
+            let mut report = OrderStatusReport::new(
+                self.account_id,
+                instrument_id,
+                resolved_client_order_id,
+                venue_order_id,
+                cached.order_side().into(),
+                cached.order_type(),
+                cached.time_in_force(),
+                order_status,
+                cached.quantity(),
+                cached.filled_qty(),
+                ts_init,
+                ts_init,
+                ts_init,
+                None,
+            );
+            report.price = cached_price;
+
+            log::debug!(
+                "Order {venue_order_id} has unsettled trades; reporting non-terminal {order_status}"
+            );
+            return Ok(Some(report));
         }
+
+        if order_fills.is_empty() {
+            let Some(cached) = cached.as_ref() else {
+                log::debug!(
+                    "Order {venue_order_id} not active at venue, no trades found, and no cached order; nothing to recover"
+                );
+                return Ok(None);
+            };
+
+            if cached.ts_accepted().is_none() {
+                return Ok(None);
+            }
+
+            log::debug!(
+                "Order {venue_order_id} not active at venue and no trades found; recovering as Canceled"
+            );
+            let mut report = OrderStatusReport::new(
+                self.account_id,
+                instrument_id,
+                resolved_client_order_id,
+                venue_order_id,
+                cached.order_side().into(),
+                cached.order_type(),
+                cached.time_in_force(),
+                OrderStatus::Canceled,
+                cached.quantity(),
+                cached.filled_qty(),
+                ts_init,
+                ts_init,
+                ts_init,
+                None,
+            );
+            report.price = cached_price;
+            report.cancel_reason = Some("ORDER_NOT_FOUND_AT_VENUE".to_string());
+            return Ok(Some(report));
+        }
+
+        let Some(quantity) = cached_quantity else {
+            log::debug!(
+                "Order {venue_order_id} has trades but no cached order; deferring to engine"
+            );
+            return Ok(None);
+        };
+
+        let total_filled_dec = sum_filled_quantity(&order_fills);
+        let avg_px = weighted_average_price(&order_fills, total_filled_dec);
+        let raw_filled_qty = Quantity::from_decimal_dp(total_filled_dec, size_prec)?;
+        let order_side = cached_side.unwrap_or(order_fills[0].order_side);
+        let ts_event = order_fills
+            .iter()
+            .map(|f| f.ts_event)
+            .max()
+            .unwrap_or(ts_init);
+
+        let order_status = recovered_terminal_order_status(cached_tif, quantity, raw_filled_qty);
+        let filled_qty = raw_filled_qty;
+
+        log::debug!(
+            "Recovered {} status for {venue_order_id} from {} trade(s) (filled_qty={filled_qty}, quantity={quantity})",
+            if order_status == OrderStatus::Filled {
+                "Filled"
+            } else {
+                "Canceled (partially filled)"
+            },
+            order_fills.len(),
+        );
+
+        let mut report = OrderStatusReport::new(
+            self.account_id,
+            instrument_id,
+            resolved_client_order_id,
+            venue_order_id,
+            order_side.into(),
+            cached_order_type,
+            cached_tif,
+            order_status,
+            quantity,
+            filled_qty,
+            ts_event,
+            ts_event,
+            ts_init,
+            None,
+        );
+        report.price = cached_price;
+        report.avg_px = avg_px;
+        normalize_terminal_order_report_quantity(&mut report, Quantity::zero(size_prec));
 
         Ok(Some(report))
     }
 
-    fn resolve_venue_order_id(
-        &self,
-        venue_order_id: Option<VenueOrderId>,
-        client_order_id: Option<ClientOrderId>,
-    ) -> Option<VenueOrderId> {
-        venue_order_id
-            .or_else(|| client_order_id.and_then(|id| self.order_contexts.venue_order_id(&id)))
-            .or_else(|| {
-                client_order_id.and_then(|id| {
-                    self.core
-                        .cache()
-                        .order(&id)
-                        .and_then(|order| order.venue_order_id())
-                })
-            })
-            .or_else(|| client_order_id.and_then(|id| self.pending_submits.venue_order_id(id)))
+    fn collection_load_ids(&self, cmd: &GenerateOrderStatusReports) -> Option<&[InstrumentId]> {
+        if cmd.instrument_id.is_some() {
+            None
+        } else {
+            self.load_ids()
+        }
     }
 
-    pub(super) async fn generate_order_status_reports_impl(
+    /// Collects bulk order reports.
+    ///
+    /// With `cached_filled`, a worker also collects confirmed fills whenever any report could
+    /// exceed its cached filled quantity, since the core-thread continuation cannot fetch them.
+    async fn collect_order_status_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
-    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        cached_filled: Option<&AHashMap<ClientOrderId, Quantity>>,
+    ) -> anyhow::Result<CollectedOrderReports> {
         let params = crate::http::query::GetOrdersParams::default();
         let mut orders = self
             .http_client
@@ -752,7 +1122,7 @@ impl PolymarketExecutionClient {
             .await
             .context("failed to fetch orders")?;
         let pending_promotions = self.ws_dispatch_state.lock().pending_modify_promotions();
-        for promotion in pending_promotions {
+        for promotion in &pending_promotions {
             if orders
                 .iter()
                 .any(|order| order.id == promotion.venue_order_id.as_str())
@@ -777,24 +1147,195 @@ impl PolymarketExecutionClient {
         }
 
         let ctx = self.fill_context();
-        let collection_load_ids = if cmd.instrument_id.is_some() {
-            None
-        } else {
-            self.config.reconciliation_load_ids()
-        };
-        let (mut reports, _) = super::reconciliation::build_order_reports_from_orders(
+        let (reports, _) = super::reconciliation::build_order_reports_from_orders(
             &orders,
             &self.shared_token_instruments,
             &ctx,
             cmd.instrument_id,
             self.clock.get_time_ns(),
-            collection_load_ids,
+            self.collection_load_ids(cmd),
         )?;
 
+        let confirmed_fills = match cached_filled {
+            Some(cached_filled)
+                if may_need_confirmed_fills(&reports, &pending_promotions, cached_filled) =>
+            {
+                Some(self.collect_confirmed_fills(cmd).await)
+            }
+            _ => None,
+        };
+
+        Ok(CollectedOrderReports {
+            reports,
+            confirmed_fills,
+        })
+    }
+
+    async fn collect_confirmed_fills(&self, cmd: &GenerateOrderStatusReports) -> ConfirmedFills {
+        match self
+            .http_client
+            .get_trades(GetTradesParams::default())
+            .await
+        {
+            Ok(trades) => ConfirmedFills::Fetched(
+                build_fill_reports_from_trades(
+                    &trades,
+                    &self.fill_context(),
+                    &self.shared_token_instruments,
+                    FillReportScope::new(cmd.instrument_id, None),
+                    self.clock.get_time_ns(),
+                    self.collection_load_ids(cmd),
+                    None,
+                )
+                .map(|(fills, _)| fills),
+            ),
+            Err(e) => ConfirmedFills::Unavailable(e.to_string()),
+        }
+    }
+
+    async fn collect_fill_reports(
+        &self,
+        cmd: GenerateFillReports,
+        authority: anyhow::Result<Option<TargetOrderAuthority>>,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let trades = self
+            .http_client
+            .get_trades(super::reconciliation::trades_params_for_window(
+                cmd.start, cmd.end,
+            ))
+            .await
+            .context("failed to fetch trades")?;
+
+        let ctx = self.fill_context();
+        let authority = authority?;
+        let scope_instrument_id = cmd
+            .instrument_id
+            .or_else(|| authority.as_ref().and_then(|value| value.instrument_id));
+        let expected_order_side = authority.as_ref().and_then(|value| value.order_side);
+        let collection_load_ids = if cmd.instrument_id.is_some() || cmd.venue_order_id.is_some() {
+            None
+        } else {
+            self.load_ids()
+        };
+
+        let (reports, _) = build_fill_reports_from_trades(
+            &trades,
+            &ctx,
+            &self.shared_token_instruments,
+            FillReportScope::new(scope_instrument_id, cmd.venue_order_id)
+                .with_expected_order_side(expected_order_side),
+            self.clock.get_time_ns(),
+            collection_load_ids,
+            None,
+        )?;
+
+        let reports = apply_fill_time_filters(reports, cmd.start, cmd.end);
+
+        log::debug!("Generated {} fill reports", reports.len());
+        Ok(reports)
+    }
+
+    async fn collect_position_status_reports(
+        &self,
+        cmd: &GeneratePositionStatusReports,
+        resolved_balances: ResolvedBalanceScope,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        anyhow::ensure!(
+            self.signer_type != PolymarketSignerType::Session,
+            "Session positions cannot be inferred from wallet-wide holdings"
+        );
+        let ctx = self.fill_context();
+        let positions = self
+            .data_api_client
+            .get_positions(ctx.user_address)
+            .await
+            .context("failed to fetch positions from Data API")?;
+
+        let ts_now = self.clock.get_time_ns();
+        let reports = build_reconciliation_position_reports(
+            &positions,
+            self.account_id,
+            ts_now,
+            &self.shared_token_instruments,
+            cmd.instrument_id,
+            self.load_ids(),
+            &resolved_balances,
+        )?;
+
+        log::debug!("Generated {} position status reports", reports.len());
+        Ok(reports)
+    }
+}
+
+/// Returns whether any collected report could need confirmed fills on the core thread.
+///
+/// Considers each report both as collected and as a pending replacement promotion would bind it,
+/// against cached filled quantities snapshotted before collection.
+fn may_need_confirmed_fills(
+    reports: &[OrderStatusReport],
+    pending_promotions: &[ModifyPromotion],
+    cached_filled: &AHashMap<ClientOrderId, Quantity>,
+) -> bool {
+    let exceeds_cached = |client_order_id: Option<ClientOrderId>, filled_qty: Quantity| {
+        let cached = client_order_id
+            .and_then(|id| cached_filled.get(&id).copied())
+            .unwrap_or_else(|| Quantity::zero(filled_qty.precision));
+        filled_qty > cached
+    };
+
+    reports.iter().any(|report| {
+        exceeds_cached(report.client_order_id, report.filled_qty)
+            || pending_promotions
+                .iter()
+                .filter(|promotion| promotion.venue_order_id == report.venue_order_id)
+                .any(|promotion| {
+                    promotion
+                        .prior_filled
+                        .checked_add(report.filled_qty)
+                        .is_some_and(|filled_qty| {
+                            exceeds_cached(Some(promotion.client_order_id), filled_qty)
+                        })
+                })
+    })
+}
+
+/// Drops a canceled single-order report for a leg replaced by a modification.
+fn finish_order_status_report(
+    report: Option<OrderStatusReport>,
+    venue_order_id: VenueOrderId,
+    ws_dispatch_state: &Mutex<WsDispatchState>,
+) -> Option<OrderStatusReport> {
+    report.filter(|report| {
+        report.order_status != OrderStatus::Canceled
+            || !ws_dispatch_state
+                .lock()
+                .suppress_modify_cancel_reemit(venue_order_id)
+    })
+}
+
+/// Core-thread finishing for bulk order reports.
+///
+/// Binds pending replacement legs, emits their modification outcomes, and caps filled
+/// quantities against current cache state.
+struct OrderReportsFinisher {
+    core: ExecutionClientCore,
+    emitter: ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    fill_tracker: Arc<OrderFillTrackerMap>,
+    settlement: Arc<SettlementRegistry>,
+    order_contexts: Arc<OrderContextRegistry>,
+    ws_dispatch_state: Arc<Mutex<WsDispatchState>>,
+}
+
+impl OrderReportsFinisher {
+    fn promote_replacements(
+        &self,
+        reports: &mut Vec<OrderStatusReport>,
+    ) -> anyhow::Result<AHashMap<VenueOrderId, Quantity>> {
         let mut modify_fill_offsets = AHashMap::new();
         let mut rejected_replacements = AHashSet::new();
 
-        for report in &mut reports {
+        for report in &mut *reports {
             let promotion = self
                 .ws_dispatch_state
                 .lock()
@@ -909,48 +1450,64 @@ impl PolymarketExecutionClient {
             });
         }
 
-        let needs_confirmed_fills = reports.iter().any(|report| {
+        Ok(modify_fill_offsets)
+    }
+
+    fn needs_confirmed_fills(&self, reports: &[OrderStatusReport]) -> bool {
+        reports.iter().any(|report| {
             let cached_filled = report
                 .client_order_id
                 .and_then(|id| self.core.cache().order(&id).map(|order| order.filled_qty()))
                 .unwrap_or_else(|| Quantity::zero(report.quantity.precision));
             report.filled_qty > cached_filled
-        });
-        let confirmed_fills = if needs_confirmed_fills {
-            match self
-                .http_client
-                .get_trades(GetTradesParams::default())
-                .await
-            {
-                Ok(trades) => {
-                    let (fills, _) = build_fill_reports_from_trades(
-                        &trades,
-                        &ctx,
-                        &self.shared_token_instruments,
-                        FillReportScope::new(cmd.instrument_id, None),
-                        self.clock.get_time_ns(),
-                        collection_load_ids,
-                        None,
-                    )?;
-                    let cache = self.core.cache();
-                    let orders = cache.orders_refs(
-                        Some(&self.core.venue),
-                        cmd.instrument_id.as_ref(),
-                        None,
-                        Some(&self.core.account_id),
-                        None,
-                    );
-                    ctx.settlement
-                        .report_filled_quantities(&fills, orders.iter().map(|order| &**order))?
-                }
-                Err(e) => {
-                    log::warn!("Failed to fetch confirmed fills for open-order check: {e}");
-                    Default::default()
-                }
+        })
+    }
+
+    fn confirmed_fill_quantities(
+        &self,
+        needs_confirmed_fills: bool,
+        confirmed_fills: Option<ConfirmedFills>,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<AHashMap<VenueOrderId, Decimal>> {
+        if !needs_confirmed_fills {
+            return Ok(AHashMap::new());
+        }
+
+        match confirmed_fills {
+            Some(ConfirmedFills::Fetched(fills)) => {
+                let fills = fills?;
+                let cache = self.core.cache();
+                let orders = cache.orders_refs(
+                    Some(&self.core.venue),
+                    cmd.instrument_id.as_ref(),
+                    None,
+                    Some(&self.core.account_id),
+                    None,
+                );
+                self.settlement
+                    .report_filled_quantities(&fills, orders.iter().map(|order| &**order))
             }
-        } else {
-            Default::default()
-        };
+            Some(ConfirmedFills::Unavailable(e)) => {
+                log::warn!("Failed to fetch confirmed fills for open-order check: {e}");
+                Ok(AHashMap::new())
+            }
+            None => {
+                log::warn!("Confirmed fills were not collected for open-order check");
+                Ok(AHashMap::new())
+            }
+        }
+    }
+
+    fn finish(
+        &self,
+        mut reports: Vec<OrderStatusReport>,
+        modify_fill_offsets: &AHashMap<VenueOrderId, Quantity>,
+        needs_confirmed_fills: bool,
+        confirmed_fills: Option<ConfirmedFills>,
+        cmd: &GenerateOrderStatusReports,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let confirmed_fills =
+            self.confirmed_fill_quantities(needs_confirmed_fills, confirmed_fills, cmd)?;
 
         for report in &mut reports {
             let cached_order = report
@@ -1026,135 +1583,6 @@ impl PolymarketExecutionClient {
 
         log::debug!("Generated {} order status reports", reports.len());
         Ok(reports)
-    }
-
-    pub(super) async fn generate_fill_reports_impl(
-        &self,
-        cmd: GenerateFillReports,
-    ) -> anyhow::Result<Vec<FillReport>> {
-        let trades = self
-            .http_client
-            .get_trades(super::reconciliation::trades_params_for_window(
-                cmd.start, cmd.end,
-            ))
-            .await
-            .context("failed to fetch trades")?;
-
-        let ctx = self.fill_context();
-        let authority = cmd
-            .venue_order_id
-            .map(|venue_order_id| {
-                self.resolve_target_order_authority(None, venue_order_id, cmd.instrument_id)
-            })
-            .transpose()?;
-        let scope_instrument_id = cmd
-            .instrument_id
-            .or_else(|| authority.as_ref().and_then(|value| value.instrument_id));
-        let expected_order_side = authority.as_ref().and_then(|value| value.order_side);
-        let collection_load_ids = if cmd.instrument_id.is_some() || cmd.venue_order_id.is_some() {
-            None
-        } else {
-            self.config.reconciliation_load_ids()
-        };
-
-        let (reports, _) = build_fill_reports_from_trades(
-            &trades,
-            &ctx,
-            &self.shared_token_instruments,
-            FillReportScope::new(scope_instrument_id, cmd.venue_order_id)
-                .with_expected_order_side(expected_order_side),
-            self.clock.get_time_ns(),
-            collection_load_ids,
-            None,
-        )?;
-
-        let reports = apply_fill_time_filters(reports, cmd.start, cmd.end);
-
-        log::debug!("Generated {} fill reports", reports.len());
-        Ok(reports)
-    }
-
-    pub(super) async fn generate_position_status_reports_impl(
-        &self,
-        cmd: &GeneratePositionStatusReports,
-    ) -> anyhow::Result<Vec<PositionStatusReport>> {
-        anyhow::ensure!(
-            self.config.signer_type != PolymarketSignerType::Session,
-            "Session positions cannot be inferred from wallet-wide holdings"
-        );
-        let ctx = self.fill_context();
-        let positions = self
-            .data_api_client
-            .get_positions(ctx.user_address)
-            .await
-            .context("failed to fetch positions from Data API")?;
-
-        let ts_now = self.clock.get_time_ns();
-        let reports = build_reconciliation_position_reports(
-            &positions,
-            self.core.account_id,
-            ts_now,
-            &self.shared_token_instruments,
-            cmd.instrument_id,
-            self.config.reconciliation_load_ids(),
-            &self.resolved_balance_scope(),
-        )?;
-
-        log::debug!("Generated {} position status reports", reports.len());
-        Ok(reports)
-    }
-
-    pub(super) async fn generate_mass_status_impl(
-        &self,
-        lookback_mins: Option<u64>,
-    ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-        let ctx = self.fill_context();
-
-        let (cached_venue_order_ids, retained_trade_ids) = {
-            let cache = self.core.cache();
-
-            // A reloaded cache indexes only each order's current venue order, not its earlier legs
-            let cached_venue_order_ids: AHashSet<VenueOrderId> = cache
-                .orders(Some(&self.core.venue), None, None, None, None)
-                .iter()
-                .flat_map(|order| order.events())
-                .filter_map(|event| event.venue_order_id())
-                .collect();
-            let mut retained_trade_ids: AHashMap<InstrumentId, AHashSet<TradeId>> = AHashMap::new();
-
-            for position in cache.positions_open(
-                Some(&self.core.venue),
-                None,
-                None,
-                Some(&self.core.account_id),
-                None,
-            ) {
-                retained_trade_ids
-                    .entry(position.instrument_id)
-                    .or_default()
-                    .extend(position.trade_ids.iter().copied());
-            }
-
-            (cached_venue_order_ids, retained_trade_ids)
-        };
-
-        super::reconciliation::generate_mass_status(
-            &self.http_client,
-            &self.data_api_client,
-            &self.shared_token_instruments,
-            &ctx,
-            &self.core,
-            lookback_mins,
-            self.config.reconciliation_load_ids(),
-            &self.resolved_balance_scope(),
-            &retained_trade_ids,
-            |venue_order_id| cached_venue_order_ids.contains(venue_order_id),
-        )
-        .await
-    }
-
-    fn resolved_balance_scope(&self) -> ResolvedBalanceScope {
-        ResolvedBalanceScope::from_cache(&self.core.cache(), self.core.venue, self.core.account_id)
     }
 }
 
