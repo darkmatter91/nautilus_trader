@@ -13,7 +13,7 @@ The following applies to **all** source files (Rust, Python, shell, etc.):
 - Lines should generally stay below **100 characters**; wrap thoughtfully when necessary.
 - Use American English spelling (`color`, `serialize`, `behavior`), enforced by `.typos.toml`.
   Preserve external API spellings through exact identifier exceptions; exclude verbatim data and generated files.
-  Run `prek run typos --all-files` to check the repository.
+  Run `prek run typos --all-files` to check the repository, or `make typos` if you only have the `typos` binary installed.
 
 ### Shell scripts
 
